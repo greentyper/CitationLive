@@ -4,7 +4,9 @@
 
 CitationLive adds the Gemini Live voice assistant to a speaker. Spotify, Google Calendar and Tasks, and a personalized Google News feed are optional.
 
-> **Important:** only Spotify is currently supported. Use of the exploit, installer, and CitationLive is entirely at your own risk. The author is not responsible for device damage, data loss, or any other consequences.
+> **Important:** only Spotify is currently supported and smart home functionality does not work. Use of the exploit, installer, and CitationLive is entirely at your own risk. The author is not responsible for device damage, data loss, or any other consequences.
+
+The repository contains two parts: `ADB-Exploit/` is the exploit that enables network ADB on the speaker, and `CitationLive/` contains the installer and components that install and run Gemini Live.
 
 Run `setup.bat` from the root of the extracted distribution. The script only opens the CitationLive menu; the exploit and installation are started from menu options.
 
