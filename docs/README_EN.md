@@ -8,7 +8,7 @@ For a complete installation, run `setup.bat` from the root of the extracted dist
 
 ## Compatibility
 
-Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit involves a service in Harman/JBL firmware, so the same vulnerability may affect other devices that use the service. CitationLive compatibility with other models depends on the firmware's architecture and audio components and requires separate testing.
+Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit involves a service in Harman/JBL firmware, so the same vulnerability may affect other devices that use the service. CitationLive compatibility with other models depends on the firmware's architecture and audio components and requires separate testing. If CitationLive works successfully on another speaker model, please report it by opening an issue in the repository.
 
 ## Requirements
 
