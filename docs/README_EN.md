@@ -25,8 +25,10 @@ Users in Russia may need to use a VPN once to open Google AI Studio and create t
 
 1. Open `setup.bat` from the root of the extracted distribution.
 2. For a complete one-step installation, choose **[1]** and follow the wizard. For separate steps, choose **[3]**, enter the speaker IP, enable network ADB through the exploit, then choose **[4]** to install CitationLive.
-4. Enter your Gemini API key and choose a city for weather and local time. Keep the window open while the speaker reboots and the installer checks the Gemini Live connection.
-5. After the connection check passes, say “Hey Google” and ask a question. If the installer reports that the files were installed but Gemini Live is unavailable, check your key and use option **[8]** to review DNS or proxy settings.
+3. Enter your Gemini API key and choose a city for weather and local time. Keep the window open while the speaker reboots and the installer checks the Gemini Live connection.
+4. After the connection check passes, say “Hey Google” and ask a question. If the installer reports that the files were installed but Gemini Live is unavailable, check your key and use option **[8]** to review DNS or proxy settings.
+
+Before copying files, the installer automatically backs up every affected path: `/data/opt/citation-gemini`, `/data/alsa_looper.sh`, `/data/home/chrome`, `/chrome/lib/libassistant.so`, `/chrome/process.json`, and the existing runtime log. Backups are stored under `/data/opt/citation-gemini-backups/`; installation does not start if the backup fails.
 
 ## Optional settings
 

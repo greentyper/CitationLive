@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 import webbrowser
+from datetime import datetime, timezone
 
 ROOT = Path(__file__).resolve().parent
 # Bundled ADB on Windows; system ADB on other hosts.
@@ -563,6 +564,36 @@ def deploy_run(*args, **kwargs):
     return result
 
 
+def create_install_backup(adb_serial):
+    """Archive files that the installer will replace before copying anything."""
+    script = ROOT / 'runtime' / 'backup_before_install.sh'
+    if not script.is_file():
+        log("Не найден скрипт резервного копирования.", 'ERR')
+        return False
+
+    backup_id = (
+        datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+        + f'-{os.getpid()}'
+    )
+    remote_script = f'/data/.citationlive-backup-{backup_id}.sh'
+    try:
+        deploy_run([str(ADB), '-s', adb_serial, 'push', str(script), remote_script],
+                   capture_output=True)
+        command = (
+            f'chmod 700 {remote_script} && '
+            f'/bin/sh {remote_script} {backup_id}; rc=$?; '
+            f'rm -f {remote_script}; exit $rc'
+        )
+        result = deploy_run([str(ADB), '-s', adb_serial, 'shell', command],
+                            capture_output=True, text=True, errors='replace')
+        backup_path = result.stdout.strip().splitlines()[-1]
+        log(f"Резервная копия создана: {backup_path}", 'OK')
+        return True
+    except (subprocess.SubprocessError, OSError, IndexError):
+        log("Не удалось создать резервную копию. Установка отменена.", 'ERR')
+        return False
+
+
 def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemini-3.8-live", force=False):
     """Step 4: Deploy Gemini voice assistant to /data over ADB."""
     print("\n" + "="*67)
@@ -605,6 +636,10 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
     while not city_input:
         city_input = input("Введите ваш город: ").strip()
     log(f"Установлен домашний город: {city_input}", 'OK')
+
+    log("Создание резервной копии существующей установки...", 'INFO')
+    if not create_install_backup(adb_serial):
+        return False
 
     log("Создание структуры каталогов /data/opt/citation-gemini...", 'INFO')
     deploy_run([str(ADB), '-s', adb_serial, 'shell',
