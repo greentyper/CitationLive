@@ -1,7 +1,5 @@
 # CitationLive
 
-> This GitHub repository contains the documentation. Installation requires a separate CitationLive distribution.
-
 [Русский](../README.md)
 
 CitationLive adds the Gemini Live voice assistant to a speaker. Spotify, Google Calendar and Tasks, and a personalized Google News feed are optional.

@@ -1,7 +1,5 @@
 # CitationLive
 
-> На GitHub опубликована документация. Для установки нужен отдельный комплект CitationLive.
-
 [English](docs/README_EN.md)
 
 CitationLive добавляет голосовой ассистент Gemini Live на колонку. Дополнительно можно подключить Spotify, Google Календарь и Задачи, а также персональную ленту Google News.
