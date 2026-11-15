@@ -4,7 +4,7 @@
 
 CitationLive adds the Gemini Live voice assistant to a speaker. Spotify, Google Calendar and Tasks, and a personalized Google News feed are optional.
 
-In the full distribution, `ADB-Exploit/` enables network ADB, then `CitationLive/` installs and configures Gemini Live over that connection. If network ADB is already working on the speaker, you can run the CitationLive installer directly.
+For a complete installation, run `setup.bat` from the root of the extracted distribution. The script first runs the exploit to enable network ADB on the speaker, then installs and configures CitationLive over that connection.
 
 ## Compatibility
 
@@ -17,23 +17,16 @@ Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit
 - A speaker and a computer on the same trusted local network. Check your router's device list for the speaker IP.
 - A Gemini API key from Google AI Studio. The installer can open the key creation page in your browser.
 
-## Direct CitationLive installation
+## CitationLive installation
 
-The command below requires root network ADB to be working on the speaker.
-
-1. Open PowerShell in the extracted folder that contains the `CitationLive` subfolder.
-2. Run this command with your speaker's IP address.
-
-   ```powershell
-   python .\CitationLive\citation_tool.py install --ip 192.168.1.100 --lang en
-   ```
-
-3. Enter your Gemini API key and choose a city for weather and local time. Keep PowerShell open while the speaker reboots and the installer checks the Gemini Live connection.
+1. Open `setup.bat` from the root of the extracted distribution.
+2. Choose a language and follow the installer prompts. It first enables root network ADB through the exploit, then installs CitationLive.
+3. Enter your Gemini API key and choose a city for weather and local time. Keep the window open while the speaker reboots and the installer checks the Gemini Live connection.
 4. After the connection check passes, say “Hey Google” and ask a question. If the installer reports that the files were installed but Gemini Live is unavailable, check your key and use option **[8]** to review DNS or proxy settings.
 
 ## Optional settings
 
-Open the menu with the command below or run `setup.bat` from the extracted folder.
+After installation, open the settings menu with the command below or run `setup.bat` again from the extracted folder.
 
 ```powershell
 python .\CitationLive\citation_tool.py run --ip 192.168.1.100 --lang en
