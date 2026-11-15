@@ -32,7 +32,7 @@ echo IP колонки не указан. / Speaker IP is required.
 pause
 exit /b 1
 )
-%CITATION_PYTHON% -B install_network.py --ip "%CITATION_IP%" --all-in-one --lang %CITATION_LANG%
+%CITATION_PYTHON% -B install_network.py --ip "%CITATION_IP%" --lang %CITATION_LANG%
 set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" exit /b 0
 echo.
