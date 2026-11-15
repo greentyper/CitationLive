@@ -6,6 +6,8 @@
 
 CitationLive adds the Gemini Live voice assistant to a speaker. Spotify, Google Calendar and Tasks, and a personalized Google News feed are optional.
 
+In the full distribution, `ADB-Exploit/` enables network ADB, then `CitationLive/` installs and configures Gemini Live over that connection. If network ADB is already working on the speaker, you can run the CitationLive installer directly.
+
 ## Compatibility
 
 Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit involves a service in Harman/JBL firmware, so the same vulnerability may affect other devices that use the service. CitationLive compatibility with other models depends on the firmware's architecture and audio components and requires separate testing.
@@ -14,10 +16,12 @@ Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit
 
 - An extracted CitationLive distribution with the `CitationLive/` folder, the `citation_tool.py` installer, and the speaker files in `CitationLive/dist/`.
 - Windows and Python 3.10 or later. Verify that `python --version` runs in PowerShell. The distribution includes ADB for Windows. The `citation_tool.py` installer uses Python's standard library.
-- A speaker with root network ADB already configured and a computer on the same trusted local network. Check your router's device list for the speaker IP.
+- A speaker and a computer on the same trusted local network. Check your router's device list for the speaker IP.
 - A Gemini API key from Google AI Studio. The installer can open the key creation page in your browser.
 
-## Installation
+## Direct CitationLive installation
+
+The command below requires root network ADB to be working on the speaker.
 
 1. Open PowerShell in the extracted folder that contains the `CitationLive` subfolder.
 2. Run this command with your speaker's IP address.
