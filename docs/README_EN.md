@@ -19,6 +19,8 @@ Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit
 - A speaker and a computer on the same trusted local network. Check your router's device list for the speaker IP.
 - A Gemini API key from Google AI Studio. The installer can open the key creation page in your browser.
 
+Users in Russia may need to use a VPN once to open Google AI Studio and create the key.
+
 ## CitationLive installation
 
 1. Open `setup.bat` from the root of the extracted distribution.
