@@ -24,15 +24,7 @@ echo Установите Python и снова откройте setup.bat.
 pause
 exit /b 1
 :ready
-echo.
-set /p "CITATION_IP=IP колонки / Speaker IP: "
-if not defined CITATION_IP (
-echo.
-echo IP колонки не указан. / Speaker IP is required.
-pause
-exit /b 1
-)
-%CITATION_PYTHON% -B install_network.py --ip "%CITATION_IP%" --lang %CITATION_LANG%
+%CITATION_PYTHON% -B CitationLive\citation_tool.py run --lang %CITATION_LANG%
 set "RC=%ERRORLEVEL%"
 if "%RC%"=="0" exit /b 0
 echo.

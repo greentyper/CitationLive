@@ -4,7 +4,7 @@
 
 CitationLive adds the Gemini Live voice assistant to a speaker. Spotify, Google Calendar and Tasks, and a personalized Google News feed are optional.
 
-Run `setup.bat` from the root of the extracted distribution. The script first runs the exploit to enable network ADB on the speaker, then opens the CitationLive menu.
+Run `setup.bat` from the root of the extracted distribution. The script only opens the CitationLive menu; the exploit and installation are started from menu options.
 
 ## Compatibility
 
@@ -20,8 +20,7 @@ Tested on the **Harman Kardon Citation One MK3 (MKIII)**. The researched exploit
 ## CitationLive installation
 
 1. Open `setup.bat` from the root of the extracted distribution.
-2. Choose a language, enter the speaker IP, and wait for the exploit to enable network ADB.
-3. In the menu, choose **[1]** to install CitationLive, or select another required option. Installation does not start automatically.
+2. For a complete one-step installation, choose **[1]** and follow the wizard. For separate steps, choose **[3]**, enter the speaker IP, enable network ADB through the exploit, then choose **[4]** to install CitationLive.
 4. Enter your Gemini API key and choose a city for weather and local time. Keep the window open while the speaker reboots and the installer checks the Gemini Live connection.
 5. After the connection check passes, say “Hey Google” and ask a question. If the installer reports that the files were installed but Gemini Live is unavailable, check your key and use option **[8]** to review DNS or proxy settings.
 
