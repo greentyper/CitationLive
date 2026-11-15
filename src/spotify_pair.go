@@ -1,0 +1,165 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+type spotifyPlaylistPage struct {
+	Items []spotifyEntity
+	Next  string
+}
+
+func isDaylistPlaylist(name, description, uri string) bool {
+	if strings.EqualFold(strings.TrimSpace(name), "daylist") {
+		return true
+	}
+	description = strings.ToLower(description)
+	if strings.Contains(description, "day in a playlist") ||
+		strings.Contains(description, "inspired by your listening") ||
+		strings.Contains(description, "день в плейлисте") ||
+		strings.Contains(description, "на основе ваших прослушиваний") {
+		return true
+	}
+	// Spotify uses this personalized-playlist URI family for daylist. It is a
+	// fallback for accounts where both the name and description are localized.
+	return strings.HasPrefix(uri, "spotify:playlist:37i9dQZF1EP")
+}
+
+// Resolve a search through the paired player's own Spotify session. The
+// public Web API rejects the session token, while the Connect context service
+// is the same catalog path the player uses for playback.
+func spotifySearchURIs(ctx context.Context, query string) ([]string, error) {
+	token, err := spotifyNativeToken(ctx)
+	if err != nil {
+		return nil, err
+	}
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, errors.New("Пустой поисковый запрос Spotify.")
+	}
+	endpoint := "https://gew4-spclient.spotify.com/context-resolve/v1/spotify:search:" + url.QueryEscape(query)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := (&http.Client{Timeout: 10 * time.Second}).Do(req)
+	if err != nil {
+		return nil, errors.New("Поиск Spotify недоступен.")
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Поиск Spotify: HTTP %d", resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if err != nil {
+		return nil, errors.New("Spotify вернул некорректный результат поиска.")
+	}
+	return parseSpotifySearchContext(raw)
+}
+
+func parseSpotifySearchContext(raw []byte) ([]string, error) {
+	var context struct {
+		Pages []struct {
+			Tracks []struct{ URI string }
+		}
+	}
+	if err := json.Unmarshal(raw, &context); err != nil {
+		return nil, errors.New("Spotify вернул некорректный результат поиска.")
+	}
+	seen := map[string]bool{}
+	var uris []string
+	for _, page := range context.Pages {
+		for _, track := range page.Tracks {
+			if strings.HasPrefix(track.URI, "spotify:track:") && !seen[track.URI] {
+				seen[track.URI] = true
+				uris = append(uris, track.URI)
+			}
+		}
+	}
+	if len(uris) == 0 {
+		return nil, errors.New("Spotify не нашёл совпадений.")
+	}
+	return uris, nil
+}
+
+type spotifyContextTracks struct {
+	Ready          bool
+	Cached, Length int
+	Tracks         []struct {
+		URI   string
+		Track *struct{ URI string } `json:"track"`
+	}
+}
+
+func spotifyPlaylistTrackURIs(ctx context.Context, uri string) ([]string, error) {
+	path := "/context/tracks?" + url.Values{"uri": {uri}}.Encode()
+	deadline := time.Now().Add(6 * time.Second)
+	for {
+		var listing spotifyContextTracks
+		if err := spotifyNativeJSON(ctx, http.MethodGet, path, &listing); err != nil {
+			return nil, err
+		}
+		if listing.Ready && listing.Cached >= listing.Length {
+			seen := map[string]bool{}
+			var uris []string
+			for _, entry := range listing.Tracks {
+				track := entry.URI
+				if entry.Track != nil && entry.Track.URI != "" {
+					track = entry.Track.URI
+				}
+				if strings.HasPrefix(track, "spotify:track:") && !seen[track] {
+					seen[track] = true
+					uris = append(uris, track)
+				}
+			}
+			if len(uris) == 0 {
+				return nil, errors.New("Плейлист Spotify пуст.")
+			}
+			return uris, nil
+		}
+		if time.Now().After(deadline) {
+			return nil, errors.New("Spotify не подготовил список треков плейлиста.")
+		}
+		if waitSpotifyRegistration(ctx, 300*time.Millisecond) != nil {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func pairedSpotifyPlaylists(ctx context.Context, query string, out any) error {
+	page, ok := out.(*spotifyPlaylistPage)
+	if !ok {
+		return fmt.Errorf("invalid Spotify playlist response type")
+	}
+	var reply struct {
+		Items []struct {
+			Name, URI   string
+			Owner       string `json:"owner_username"`
+			Description string
+			Length      int
+		}
+		Offset, Limit, Total int
+	}
+	if err := spotifyNativeJSON(ctx, http.MethodGet, "/library/playlists?"+query, &reply); err != nil {
+		return err
+	}
+	for _, playlist := range reply.Items {
+		item := spotifyEntity{Name: playlist.Name, URI: playlist.URI, Description: playlist.Description}
+		item.Owner.ID = playlist.Owner
+		item.Items.Total = playlist.Length
+		page.Items = append(page.Items, item)
+	}
+	if reply.Limit > 0 && reply.Offset+reply.Limit < reply.Total {
+		page.Next = fmt.Sprintf("%d", reply.Offset+reply.Limit)
+	}
+	return nil
+}

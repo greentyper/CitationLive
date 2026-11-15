@@ -1,0 +1,20 @@
+device_name: "Citation ONE"
+device_type: "speaker"
+bitrate: 320
+volume_steps: 48
+initial_volume: 18
+external_volume: true
+audio_backend: "pipe"
+audio_output_pipe: "/run/citation-connect/audio"
+audio_output_pipe_wait_for_reader: true
+server:
+  enabled: true
+  port: 18767
+  address: "127.0.0.1"
+zeroconf_enabled: true
+credentials:
+  type: device_auth
+  zeroconf:
+    persist_credentials: true
+metadata:
+  enabled: true

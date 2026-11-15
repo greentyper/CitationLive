@@ -1,0 +1,15 @@
+{
+  "key_file": "/data/opt/citation-gemini/gemini.key",
+  "model": "models/gemini-3.8-live",
+  "alsa_config": "/etc/asound-product.conf",
+  "playback": "native_cast_mixer",
+  "auto_wake": true,
+  "voice": "Charon",
+  "microphone_gain": 1,
+  "microphone_backend": "native_capture_service",
+  "native_behavior": true,
+  "replace_google": true,
+  "dj_wake": false,
+  "test_trace": false,
+  "stock_dynamic_gain": false
+}

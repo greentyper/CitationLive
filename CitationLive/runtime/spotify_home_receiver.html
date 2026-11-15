@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Spotify Connect</title>
+<script>
+window.addEventListener("error", e => fetch("/receiver-diagnostics", {method: "POST", body: e.message || "script failed"}));
+fetch("/receiver-diagnostics", {method: "POST", body: "page started"});
+</script>
+<script src="/caf.js"></script>
+<cast-media-player></cast-media-player>
+<script>
+const context = cast.framework.CastReceiverContext.getInstance();
+const player = context.getPlayerManager();
+const messages = cast.framework.messages;
+let currentTrack;
+let currentCover;
+let currentDuration;
+let spotifyPosition;
+let synchronizing = false;
+
+player.addEventListener(cast.framework.events.EventType.MEDIA_STATUS, event => {
+  const status = event.mediaStatus;
+  const media = status.media;
+  if (media && currentDuration !== undefined) media.duration = currentDuration;
+  if (spotifyPosition && status.playerState !== messages.PlayerState.IDLE) {
+    const elapsed = spotifyPosition.paused ? 0 : (performance.now() - spotifyPosition.updated) / 1000;
+    status.currentTime = Math.min(currentDuration, spotifyPosition.seconds + elapsed);
+  }
+});
+
+async function control(action, data) {
+  const response = await fetch("/control/" + action, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: data && JSON.stringify(data),
+  });
+  return response.ok;
+}
+
+for (const [type, action] of [
+  [messages.MessageType.PLAY, "resume"],
+  [messages.MessageType.PAUSE, "pause"],
+  [messages.MessageType.STOP, "stop"],
+  [messages.MessageType.SEEK, "seek"],
+]) {
+  if (!type) continue;
+  player.setMessageInterceptor(type, async request => {
+    const data = action === "seek" ? { position: Math.round(request.currentTime * 1000) } : undefined;
+    if (!await control(action, data)) return null;
+    return type === messages.MessageType.STOP || action === "seek" ? null : request;
+  });
+}
+player.setMessageInterceptor(messages.MessageType.QUEUE_UPDATE, async request => {
+  if (request.jump === 1 || request.jump === -1) {
+    await control(request.jump === 1 ? "next" : "prev");
+    return null;
+  }
+  return request;
+});
+
+async function synchronize() {
+  if (synchronizing) return;
+  synchronizing = true;
+  try {
+    const response = await fetch("/status", { cache: "no-store" });
+    if (!response.ok || response.status === 204) return;
+    const status = await response.json();
+    const track = status.track;
+    if (!track || status.stopped || track.duration < 1) return;
+    spotifyPosition = {
+      seconds: track.position / 1000,
+      paused: status.paused || status.buffering,
+      updated: performance.now(),
+    };
+    if (currentTrack !== track.uri || currentCover !== track.album_cover_url) {
+      const metadata = new messages.MusicTrackMediaMetadata();
+      metadata.title = track.name;
+      metadata.artist = track.artist_names.join(", ");
+      metadata.albumName = track.album_name;
+      if (track.album_cover_url) {
+        const cover = new URL(track.album_cover_url);
+        if (cover.hostname === "i.scdn.co") cover.hostname = "image-cdn-ak.spotifycdn.com";
+        metadata.images = [{ url: cover.href }];
+        if (cover.hostname === "image-cdn-ak.spotifycdn.com" &&
+            /^\/image\/ab67616d00001e02[0-9a-f]{24}$/.test(cover.pathname)) {
+          metadata.images[0].width = metadata.images[0].height = 300;
+        }
+      }
+      const info = new messages.MediaInformation();
+      info.contentId = track.uri;
+      info.contentUrl = new URL("/clock.wav?ms=3600000", location.href).href;
+      info.contentType = "audio/wav";
+      info.streamType = messages.StreamType.BUFFERED;
+      info.duration = track.duration / 1000;
+      info.metadata = metadata;
+      currentDuration = info.duration;
+      if (currentTrack === undefined) {
+        const request = new messages.LoadRequestData();
+        request.media = info;
+        request.autoplay = !status.paused;
+        await player.load(request);
+      } else {
+        player.setMediaInformation(info, false);
+      }
+      currentTrack = track.uri;
+      currentCover = track.album_cover_url;
+      player.broadcastStatus(true);
+    } else {
+      const state = player.getPlayerState();
+      if (status.paused && state === messages.PlayerState.PLAYING) player.pause();
+      if (!status.paused && state === messages.PlayerState.PAUSED) player.play();
+    }
+  } finally {
+    synchronizing = false;
+  }
+}
+const command = messages.Command;
+player.setSupportedMediaCommands(command.PAUSE | command.SEEK | command.QUEUE_NEXT | command.QUEUE_PREV, true);
+context.start({ disableIdleTimeout: true });
+fetch("/receiver-diagnostics", {method: "POST", body: "CAF started"});
+setInterval(() => synchronize().catch(error => fetch("/receiver-diagnostics", {
+  method: "POST",
+  body: String(error),
+})), 1000);
+</script>
+</html>

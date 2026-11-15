@@ -1,0 +1,37 @@
+[
+  {
+    "app_id": "CC32E753",
+    "display_name": "Spotify",
+    "launch_info": {
+      "source": "chrome://home",
+      "accept_from": ["local"]
+    },
+    "app_tags": {
+      "supports_audio_only": true
+    }
+  },
+  {
+    "app_id": "C17A7100",
+    "display_name": "Spotify Connect",
+    "launch_info": {
+      "source": "http://127.0.0.1:18768/receiver",
+      "accept_from": ["cast_v2"]
+    },
+    "app_tags": {
+      "supports_audio_only": true
+    },
+    "uses_ipc": true
+  },
+  {
+    "app_id": "233637DE",
+    "display_name": "YouTube",
+    "launch_info": {
+      "source": "http://127.0.0.1:18768/youtube/launch",
+      "accept_from": ["cast_v2"]
+    },
+    "app_tags": {
+      "supports_audio_only": true
+    },
+    "uses_ipc": true
+  }
+]
