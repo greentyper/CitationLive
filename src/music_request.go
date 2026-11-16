@@ -155,6 +155,9 @@ func hasCyrillicLetter(s string) bool {
 }
 
 func literalMusicFields(args M, transcript string) M {
+	if quickMediaAction(transcript) == "play" {
+		return M{"music_type": "playlist", "playlist_mode": "mood", "spoken_request": transcript}
+	}
 	text := strings.Trim(strings.TrimSpace(musicProvider.ReplaceAllString(transcript, "")), " .!?«»\"")
 	if spotifySurpriseRequest(text) {
 		return M{"track": "удиви меня", "music_type": "playlist", "playlist_mode": "mood", "spoken_request": transcript}
@@ -250,6 +253,10 @@ func closeMusicTitle(a, b string) bool {
 	if len(x) < 5 || len(y) < 5 {
 		return false
 	}
+	return musicTitleDistance(x, y) <= 2
+}
+
+func musicTitleDistance(x, y []rune) int {
 	row := make([]int, len(y)+1)
 	for j := range row {
 		row[j] = j
@@ -267,5 +274,5 @@ func closeMusicTitle(a, b string) bool {
 			previous = old
 		}
 	}
-	return row[len(y)] <= 2
+	return row[len(y)]
 }

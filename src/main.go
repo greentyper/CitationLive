@@ -68,6 +68,14 @@ func cloud() (*websocket.Conn, error) {
 func cloudContext(ctx context.Context) (*websocket.Conn, error) {
 	return cloudContextActivity(ctx, false)
 }
+func geminiLiveVoice() string {
+	voice := cfg.Voice
+	if voice == "" {
+		voice = "Charon"
+	}
+	return voice
+}
+
 func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying ...bool) (*websocket.Conn, error) {
 	netDialer := &net.Dialer{
 		Timeout:   12 * time.Second,
@@ -107,7 +115,7 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 		"На простой вопрос обычно достаточно одного-двух коротких предложений. Не добавляй дежурные предложения помощи и повтор вопроса. Подробности давай по просьбе или когда они необходимы; обязательные цитаты и важные условия сохраняй. " +
 		"Перед долгим поиском через web_search или get_news один раз коротко озвучь, что делаешь: например «Ищу в интернете» или «Проверяю новости», затем сразу вызывай инструмент в этом же ходе. Это промежуточная реплика, не окончательный ответ: после результата сообщи найденное. Не повторяй предупреждение при нескольких инструментах для одного запроса, не обещай конкретное время и не говори, что результат уже найден. Сохраняй язык пользователя. Для времени, громкости, паузы и других быстрых команд промежуточные фразы не нужны. На обычные вопросы из общих знаний отвечай сразу, без ненужного поиска. " +
 		"На одно только приветствие «Hey Google» без вопроса — просто спокойно жди вопроса пользователя и не представляйся. " +
-		"На просьбу сказать или повторить слово/фразу произнеси её сам, без вызова инструментов. Название сервиса само по себе не является командой запуска: если действие неясно, уточни. " +
+		"На просьбу сказать или повторить слово/фразу произнеси её сам, без вызова инструментов. Если получишь сообщение «Подтверждение Spotify для озвучивания», произнеси только фразу после двоеточия, без вызова функций. Название сервиса само по себе не является командой запуска: если действие неясно, уточни. " +
 		"Громкостью и воспроизведением управляй только через функции. Команда стоп означает остановить ответ. Для голосовых команд громкости используй шкалу 0–10 или проценты. После успешного изменения колонка подаёт штатный сигнал."}}}, "tools": []M{{"functionDeclarations": []M{
 		{"name": "set_volume", "description": "Set speaker volume. Pass percent 0..100 for spoken commands: «громкость 5» is level 5 of 10, so percent=50; «громкость 50» or «50 процентов» also means percent=50. Explicit percentages take precedence. Use level only for an explicitly requested native step 0..48.", "parameters": M{"type": "OBJECT", "properties": M{"percent": M{"type": "INTEGER"}, "level": M{"type": "INTEGER"}}}},
 		{"name": "get_volume", "description": "Read the current speaker volume. Use for «какая сейчас громкость?» or «на какой громкости?». Report the returned percent.", "parameters": M{"type": "OBJECT", "properties": M{}}},
@@ -115,11 +123,7 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 		{"name": "media_control", "description": "Control existing speaker music playback", "parameters": M{"type": "OBJECT", "properties": M{"action": M{"type": "STRING", "enum": []string{"pause", "resume", "next", "previous", "stop"}}}, "required": []string{"action"}}},
 		{"name": "spotify_dj_prompt", "description": "Send a live voice request to Spotify AI DJ (use whenever the user addresses DJ or asks DJ to play/change something: «диджей включи ...», «диджей поставь ...», «эй диджей ...», «попроси диджея ...», «спроси у диджея ...», «скажи диджею ...», «в диджее включи ...», «DJ play ...», «hey DJ ...»). IMPORTANT: Spotify AI DJ only understands English prompts! You MUST translate the user's Russian request into a concise, natural English DJ prompt in the `prompt` parameter (for example: «диджей включи что-нибудь новое» -> prompt='play something new and fresh', «диджей поставь весёлый рок» -> prompt='upbeat energetic rock', «диджей что-нибудь спокойное на вечер» -> prompt='chill relaxing evening vibes', «диджей включи хиты девяностых» -> prompt='90s hits'). Do NOT call play_music when the user addresses DJ with a prompt/vibe — ALWAYS call spotify_dj_prompt with an English prompt!", "parameters": M{"type": "OBJECT", "properties": M{"prompt": M{"type": "STRING", "description": "The music prompt or vibe for Spotify DJ, ALWAYS translated into concise natural English (e.g. 'play something new', 'upbeat electronic music', 'chill late night vibes')."}}, "required": []string{"prompt"}}},
 	}}}}}
-	voice := cfg.Voice
-	if voice == "" {
-		voice = "Charon"
-	}
-	setup["setup"].(M)["generationConfig"].(M)["speechConfig"] = M{"voiceConfig": M{"prebuiltVoiceConfig": M{"voiceName": voice}}}
+	setup["setup"].(M)["generationConfig"].(M)["speechConfig"] = M{"voiceConfig": M{"prebuiltVoiceConfig": M{"voiceName": geminiLiveVoice()}}}
 	setup["setup"].(M)["realtimeInputConfig"] = M{"automaticActivityDetection": M{"startOfSpeechSensitivity": "START_SENSITIVITY_HIGH", "endOfSpeechSensitivity": "END_SENSITIVITY_LOW", "prefixPaddingMs": 300, "silenceDurationMs": 700}, "turnCoverage": "TURN_INCLUDES_ONLY_ACTIVITY"}
 	if manualActivity {
 		setup["setup"].(M)["realtimeInputConfig"] = M{"automaticActivityDetection": M{"disabled": true}, "turnCoverage": "TURN_INCLUDES_ALL_INPUT"}
@@ -183,14 +187,14 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 		"Если пользователь спрашивает погоду и город не назван — используй сохранённый домашний город из preferences. Если город не сохранён, коротко уточни его; не выдумывай. Вызывай get_weather только когда пользователь действительно спрашивает про погоду или температуру, и никогда не вызывай функции на фразы отказа («не надо», «мне не надо», «хватит», «отбой») или неразборчивый шум. " +
 		"Если пользователь обращается к диджею с пожеланием («диджей, включи что-нибудь новое», «эй диджей, поставь рок», «попроси диджея включить что-то спокойное», «скажи диджею ...») — ВСЕГДА вызывай функцию spotify_dj_prompt и ОБЯЗАТЕЛЬНО переводи запрос в параметре prompt на естественный английский язык (например 'play something new', 'upbeat rock', 'something chill and relaxing'), так как Spotify DJ понимает только английский! Если же пользователь просто говорит «включи диджея» без пожеланий — вызывай play_music(music_type='playlist', playlist_mode='named', track='DJ'). " +
 		"Если пользователь просит музыку по настроению, жанру или атмосфере (например 'что-нибудь фэмили френдли', 'спокойное', 'для фона', 'рок', 'веселое') без упоминания диджея — ВСЕГДА вызывай play_music с music_type='playlist' и темой в track, никогда не переспрашивай! " +
-		"Если музыка на колонке уже играла или стоит на паузе, и пользователь говорит «play», «играй», «продолжи», «возобнови», «дальше», «музыку» — ВСЕГДА вызывай media_control(action='resume'), ни в коем случае НЕ вызывай play_music, чтобы не сбросить текущую очередь треков! " +
+		"Для «продолжи», «возобнови», «resume» вызывай media_control(action='resume'). Для «дальше», «следующий трек» вызывай media_control(action='next'). Для «включи музыку» запускай подбор плейлиста через play_music, в том числе когда музыка уже играет или стоит на паузе. " +
 		"Если пользователь просит включить музыку вообще ('включи музыку', 'вруби музыку', 'сыграй что-нибудь') без конкретного названия — НИКОГДА не переспрашивай какую музыку включить! Сразу вызывай функцию play_music с music_type='playlist' и пустым track. " +
 		"На отдельную команду «Удиви меня» или «Surprise me» сразу вызови play_music с music_type=playlist, playlist_mode=mood, track='удиви меня'. Это просьба включить случайную персональную подборку Spotify. После запроса музыки сразу вызови play_music. Если функция вернула ready_to_play, произнеси только короткую фразу из announcement. Если функция вернула ошибку, кратко объясни её. Переноси название и исполнителя точно из просьбы, не меняй песню на похожую. Не повторяй функцию без новой команды."
 	parts[0]["text"] = parts[0]["text"].(string) + " ПРАВИЛА ЗАВЕРШЕНИЯ РАЗГОВОРА (функция end_session): " +
 		"1) При музыке: если на колонке играет музыка, она приглушена на время ответа. Вызывай end_session при явных словах завершения («спасибо», «хватит») или разовых командах плеера/громкости. На обычные вопросы, факты и диалог НЕ вызывай end_session — дай пользователю возможность задать уточняющий вопрос или ответить. " +
 		"2) Без музыки: вызывай end_session, когда разговор явно завершён — прощание или слова завершения («спасибо», «понял», «всё», «пока», «отбой», «хватит»), либо явный отказ или безразличие («не хочу», «не надо», «стоп», «ладно, всё»). Если пользователь отказался от твоего предложения продолжить, не предлагай снова и не жди — вызови end_session и коротко попрощайся. На обычный ответ или вопрос end_session не нужен: окно продолжения и таймер простоя закроют сессию сами, а микрофон не должен оставаться открытым ради случайного фонового шума. " +
 		"Для коротких команд управления музыкой и громкостью достаточно действия, без лишнего речевого подтверждения. Не предлагай помощь без необходимости. " + recentConversation.instruction(time.Now())
-	parts[0]["text"] = parts[0]["text"].(string) + voicePersona(voice)
+	parts[0]["text"] = parts[0]["text"].(string) + voicePersona(geminiLiveVoice())
 	if isMusic {
 		text := "\nВАЖНО: Сейчас на колонке играет музыка (она временно приглушена)."
 		if name, _, typ := directSpotify.playbackContext(); name != "" {
@@ -218,12 +222,12 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 	if isRecentDJWake() {
 		parts[0]["text"] = parts[0]["text"].(string) + "\nВАЖНО: Эта сессия активирована напрямую голосовым ключевым словом «Диджей» (Hey DJ). Пользователь сейчас обращается непосредственно к Spotify AI DJ! Любое музыкальное пожелание, жанр, настроение, темп или просьбу в этой реплике (например «включи что-нибудь новое», «поставь рок», «что-нибудь спокойное») ОБЯЗАТЕЛЬНО передай в функцию spotify_dj_prompt с переводом запроса на естественный английский язык в параметре prompt."
 	}
-	if err = c.WriteJSON(setup); err != nil {
+	if err := c.WriteJSON(setup); err != nil {
 		c.Close()
 		return nil, err
 	}
 	var reply M
-	if err = c.ReadJSON(&reply); err != nil {
+	if err := c.ReadJSON(&reply); err != nil {
 		c.Close()
 		return nil, err
 	}
@@ -867,11 +871,7 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 	c.connectingCancel = nil
 	c.active = s
 	// Keep the already-published listening phase across the cloud handshake.
-	voiceName := cfg.Voice
-	if voiceName == "" {
-		voiceName = "Charon"
-	}
-	c.stats = M{"voice": voiceName, "server_events": 0, "session_limit_seconds": 900}
+	c.stats = M{"voice": geminiLiveVoice(), "server_events": 0, "session_limit_seconds": 900}
 	if cfg.TestTrace {
 		c.stats["test_buffered_frames_at_setup"] = len(earlyMic.frames)
 	}
@@ -1689,6 +1689,9 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 					if !echoTranscript && requestGuard.acceptTranscript(inputText) {
 						meaningfulInput.Store(true)
 						lastMeaningfulAt.Store(time.Now().UnixNano())
+						if !replyAudioSinceInput && !awaitingToolResponse.Load() {
+							finalReplyDeadline.CompareAndSwap(0, time.Now().Add(9*time.Second).UnixNano())
+						}
 						s.touchActivity()
 						if !nativeInputActive.Load() && !responding {
 							c.setPhase("thinking")
@@ -1722,16 +1725,48 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 						recognitionAction = "media:" + action
 						log.Println("Quick voice media action:", action)
 						s.stopPlayer()
+						if action == "play" {
+							closeInput()
+							c.setPhase("announcing_music")
+							finalReplyDeadline.Store(0)
+							selection := toolContext(ctx, "play_music", M{"music_type": "playlist", "playlist_mode": "mood"})
+							if selection["ok"] != true {
+								log.Println("Spotify selection failed:", selection["error"])
+								return
+							}
+							release, err := ducking.holdSpotifyStartupSilence()
+							if err != nil {
+								log.Println("Spotify startup mute failed:", clean(err))
+								return
+							}
+							releaseMusicSilence = release
+							musicSelection = selection
+							musicLaunch = make(chan M, 1)
+							go func(launched chan<- M) {
+								playCtx, cancelPlay := context.WithTimeout(ctx, 12*time.Second)
+								defer cancelPlay()
+								launched <- directSpotify.playContext(playCtx, selection)
+							}(musicLaunch)
+							s.speakSpotifyAnnouncement(selection)
+							if ctx.Err() != nil {
+								return
+							}
+							result := <-musicLaunch
+							musicSelection, musicLaunch = nil, nil
+							musicStarted = result["ok"] == true
+							log.Println("Spotify launch result", result["status"], result["ok"], result["error"])
+							return
+						}
 						// Use the same native media action as the model's tools,
 						// including Spotify fallback, for either input language.
-						result := tool("media_control", M{"action": action})
+						result := toolContext(ctx, "media_control", M{"action": action})
 						if result["ok"] != true {
 							log.Println("Voice media control failed:", result["error"])
 						}
 						if action == "pause" || action == "stop" {
 							mediaStopped = true
 							_ = ducking.OnExplicitPause()
-						} else if action == "resume" || action == "play" {
+						} else if action == "resume" {
 							mediaStopped = false
 						}
 						if result["ok"] == true {
@@ -1820,13 +1855,17 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 				}
 			}
 			if content["turnComplete"] == true {
-				if isSilentOrEmptyOutput(outputText) && musicSelection != nil {
-					// The model prepared a track but produced no announcement
-					// audio. Launch it instead of leaving the mic closed, the
-					// startup silence held, and then pausing the new track in
-					// session cleanup.
+				if musicSelection != nil && !replyAudioSinceInput {
+					// A completed tool turn can contain text without speech. Keep
+					// Spotify muted until the synthesized confirmation finishes.
 					selection := musicSelection
 					musicSelection = nil
+					finalReplyDeadline.Store(0)
+					c.setPhase("announcing_music")
+					s.speakSpotifyAnnouncement(selection)
+					if ctx.Err() != nil {
+						return
+					}
 					c.setPhase("launching_music")
 					result := <-musicLaunch
 					musicLaunch = nil
@@ -1834,7 +1873,7 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 						_, _ = wampCall("com.harman.gva.pause")
 						result = M{"ok": false, "status": "wrong_track_rejected", "error": "Spotify запустил другой трек."}
 					}
-					log.Println("Spotify launch result (silent announcement)", result["status"], result["ok"], result["error"])
+					log.Println("Spotify launch result", result["status"], result["ok"], result["error"])
 					if result["ok"] == true {
 						musicStarted = true
 						return
@@ -1849,7 +1888,7 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 					s.touchActivity()
 					continue
 				}
-				if isSilentOrEmptyOutput(outputText) {
+				if isSilentOrEmptyOutput(outputText) && musicSelection == nil {
 					nativeAwaitingResult.Store(false)
 					pendingTurnComplete = false
 					requestGuard.reset()
@@ -2111,19 +2150,6 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 								args = literalMusicFields(args, inputText)
 								if validation, ok := args["validation_error"].(string); ok {
 									result = M{"ok": false, "error": validation}
-								}
-								trackVal, _ := args["track"].(string)
-								artistVal, _ := args["artist"].(string)
-								isGenericPlay := (strings.TrimSpace(trackVal) == "" || trackVal == "музыка" || strings.EqualFold(trackVal, "play") || strings.EqualFold(trackVal, "плей")) && strings.TrimSpace(artistVal) == ""
-								if result == nil && isGenericPlay {
-									if native := readSpotifyNative(); native.Paused || (native.Track.URI != "" && !native.Stopped) {
-										actionResult := toolContext(ctx, "media_control", M{"action": "resume"})
-										if actionResult["ok"] == true {
-											result = M{"ok": true, "status": "ready_to_play", "announcement": "Продолжаю воспроизведение."}
-										} else {
-											result = actionResult
-										}
-									}
 								}
 								if result == nil {
 									cueDone := make(chan struct{})

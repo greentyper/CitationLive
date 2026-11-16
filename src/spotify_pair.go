@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -91,48 +92,79 @@ func parseSpotifySearchContext(raw []byte) ([]string, error) {
 	return uris, nil
 }
 
-type spotifyContextTracks struct {
-	Ready          bool
-	Cached, Length int
-	Tracks         []struct {
-		URI   string
-		Track *struct{ URI string } `json:"track"`
+// Search the Spotify catalog for playlist entities using the paired session.
+func pairedSpotifyCatalogPlaylists(ctx context.Context, query string) ([]spotifyEntity, error) {
+	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
+	defer cancel()
+	token, err := spotifyNativeToken(ctx)
+	if err != nil {
+		return nil, err
 	}
-}
-
-func spotifyPlaylistTrackURIs(ctx context.Context, uri string) ([]string, error) {
-	path := "/context/tracks?" + url.Values{"uri": {uri}}.Encode()
-	deadline := time.Now().Add(6 * time.Second)
-	for {
-		var listing spotifyContextTracks
-		if err := spotifyNativeJSON(ctx, http.MethodGet, path, &listing); err != nil {
-			return nil, err
-		}
-		if listing.Ready && listing.Cached >= listing.Length {
-			seen := map[string]bool{}
-			var uris []string
-			for _, entry := range listing.Tracks {
-				track := entry.URI
-				if entry.Track != nil && entry.Track.URI != "" {
-					track = entry.Track.URI
+	payload := M{
+		"operationName": "searchPlaylists",
+		"variables": M{
+			"searchTerm": query, "offset": 0, "limit": 12, "numberOfTopResults": 20,
+			"includePreReleases": false, "includeAlbumPreReleases": false,
+			"includeAudiobooks": true, "includeAuthors": true, "includeEpisodeContentRatingsV2": true,
+		},
+		"extensions": M{"persistedQuery": M{
+			"version": 1, "sha256Hash": "d520014e748f9ea44f7707d8df1819867ac1205e8b7f3e28f22fe5fc858921b1",
+		}},
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api-partner.spotify.com/pathfinder/v2/query", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("app-platform", "WebPlayer")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("поиск Spotify: HTTP %d", resp.StatusCode)
+	}
+	var reply struct {
+		Errors []json.RawMessage
+		Data   struct {
+			Search struct {
+				Playlists *struct {
+					Items []struct {
+						Data struct {
+							Name, URI string
+							Owner     struct {
+								Data struct{ Username, URI string }
+							} `json:"ownerV2"`
+						}
+					}
 				}
-				if strings.HasPrefix(track, "spotify:track:") && !seen[track] {
-					seen[track] = true
-					uris = append(uris, track)
-				}
-			}
-			if len(uris) == 0 {
-				return nil, errors.New("Плейлист Spotify пуст.")
-			}
-			return uris, nil
-		}
-		if time.Now().After(deadline) {
-			return nil, errors.New("Spotify не подготовил список треков плейлиста.")
-		}
-		if waitSpotifyRegistration(ctx, 300*time.Millisecond) != nil {
-			return nil, ctx.Err()
+			} `json:"searchV2"`
 		}
 	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 2<<20)).Decode(&reply); err != nil || len(reply.Errors) > 0 || reply.Data.Search.Playlists == nil {
+		return nil, errors.New("Spotify вернул некорректный ответ поиска плейлистов.")
+	}
+	var playlists []spotifyEntity
+	for _, item := range reply.Data.Search.Playlists.Items {
+		p := item.Data
+		if !strings.HasPrefix(p.URI, "spotify:playlist:") || strings.TrimSpace(p.Name) == "" {
+			continue
+		}
+		playlist := spotifyEntity{Name: p.Name, URI: p.URI}
+		playlist.Owner.ID = p.Owner.Data.Username
+		if playlist.Owner.ID == "" {
+			playlist.Owner.ID = strings.TrimPrefix(p.Owner.Data.URI, "spotify:user:")
+		}
+		playlists = append(playlists, playlist)
+	}
+	return playlists, nil
 }
 
 func pairedSpotifyPlaylists(ctx context.Context, query string, out any) error {

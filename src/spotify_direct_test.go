@@ -107,7 +107,7 @@ func TestDaylistPlaylistMatching(t *testing.T) {
 		{"funky soul funktastic sunday night", "Here's some funky soul — inspired by your listening on Sundays at night", "spotify:playlist:37i9dQZF1EP6YuccBxUcC1", true},
 		{"daylist", "", "", true},
 		{"Твой день", "Твой день в плейлисте", "", true},
-		{"Ambient Mix", "Ambient music", "spotify:playlist:37i9dQZF1EQfPh9gDMrERq", false},
+		{"Quiet Atlas", "Ambient music", "spotify:playlist:fixture-ambient", false},
 		{"Your Top Songs 2022", "Spotify Wrapped presents the songs that you loved most this year.", "spotify:playlist:37i9dQZF1F0sijgNaJdgit", false},
 		{"Personalized", "", "spotify:playlist:37i9dQZF1EP6YuccBxUcC1", true},
 	}
@@ -115,5 +115,53 @@ func TestDaylistPlaylistMatching(t *testing.T) {
 		if got := isDaylistPlaylist(tc.name, tc.description, tc.uri); got != tc.ok {
 			t.Fatalf("isDaylistPlaylist(%q, %q, %q) = %v, want %v", tc.name, tc.description, tc.uri, got, tc.ok)
 		}
+	}
+}
+
+func TestClosestLibraryPlaylist(t *testing.T) {
+	playlist := func(name, id string) spotifyEntity {
+		return spotifyEntity{Name: name, URI: "spotify:playlist:" + id}
+	}
+	orbit := playlist("Туманная Орбита Экспедиции", "orbit")
+	ambient := playlist("Ambient Atlas Lab", "ambient")
+	for _, tt := range []struct {
+		label           string
+		request         string
+		library         []spotifyEntity
+		want, ambiguous string
+	}{
+		{"normalized near title", "Туманистая орбита экспедиции", []spotifyEntity{ambient, orbit}, orbit.URI, ""},
+		{"exact before fuzzy", "Туманная орбита экспедиции", []spotifyEntity{playlist("Туманистая орбита экспедиции", "other"), orbit}, orbit.URI, ""},
+		{"same URI twice", "Ambient Atlas La", []spotifyEntity{ambient, ambient}, ambient.URI, ""},
+		{"too short", "Pop", []spotifyEntity{playlist("Pops", "pop")}, "", ""},
+		{"shared words are insufficient", "Кристаллическая орбита экспедиции", []spotifyEntity{orbit}, "", ""},
+		{"ambiguous near titles", "Ambient Atlas Lab", []spotifyEntity{playlist("Ambient Atlas Lab A", "a"), playlist("Ambient Atlas Lab B", "b")}, "spotify:playlist:a", "spotify:playlist:b"},
+	} {
+		t.Run(tt.label, func(t *testing.T) {
+			best, alternative := closestSpotifyPlaylist(tt.request, tt.library)
+			uri := func(item *spotifyEntity) string {
+				if item == nil {
+					return ""
+				}
+				return item.URI
+			}
+			if uri(best) != tt.want || uri(alternative) != tt.ambiguous {
+				t.Fatalf("matches = %q, %q; want %q, %q", uri(best), uri(alternative), tt.want, tt.ambiguous)
+			}
+		})
+	}
+}
+
+func TestMoodPlaylistUsesARealLibraryContext(t *testing.T) {
+	library := []spotifyEntity{
+		{Name: "Quiet Lab Cue", URI: "spotify:track:chill"},
+		{Name: "Workout Chill", URI: "spotify:playlist:workout"},
+		{Name: "Ambient Atlas Lab", URI: "spotify:playlist:ambient"},
+	}
+	if got := matchSpotifyMoodPlaylist("спокойная музыка для фона", "chill relaxation", library); got == nil || got.URI != library[2].URI {
+		t.Fatalf("selected %v, want Ambient Atlas Lab playlist", got)
+	}
+	if got := matchSpotifyMoodPlaylist("музыка на свадьбу", "wedding", library); got != nil {
+		t.Fatalf("selected unrelated playlist %v", got)
 	}
 }

@@ -65,12 +65,13 @@ func spotifyNativeCommand(ctx context.Context, action string, args M) error {
 	return nil
 }
 
-func resetSpotifyBeforePlay(ctx context.Context) {
+// Spotify Connect keeps manually queued tracks when a new context is loaded.
+func resetSpotifyBeforePlay(ctx context.Context) error {
 	native := readSpotifyNative()
-	if isNativeDJContext(native.ContextURI) && !native.Stopped {
-		_ = spotifyNativeCommand(ctx, "stop", M{})
-		_ = waitSpotifyRegistration(ctx, 1500*time.Millisecond)
+	if native.ContextURI == "" && native.Track.URI == "" {
+		return nil
 	}
+	return spotifyNativeCommand(ctx, "stop", M{})
 }
 
 func waitSpotifyReady(ctx context.Context, timeout time.Duration) bool {
@@ -88,12 +89,21 @@ func waitSpotifyReady(ctx context.Context, timeout time.Duration) bool {
 	return false
 }
 
-func playSpotifyNative(ctx context.Context, selection M, device, uri, kind string) M {
-	directSpotify.setPlaybackContext(selection)
-	if candidates, ok := selection["spotify_search_uris"].([]string); ok && len(candidates) > 0 {
+func playSpotifyNative(ctx context.Context, selection M, device, uri, kind string) (result M) {
+	if kind == "playlist" && !strings.HasPrefix(uri, "spotify:playlist:") {
+		return M{"ok": false, "error": "Spotify не вернул ссылку на плейлист."}
+	}
+	if err := resetSpotifyBeforePlay(ctx); err != nil {
+		return M{"ok": false, "error": err.Error()}
+	}
+	defer func() {
+		if result["ok"] == true {
+			directSpotify.setPlaybackContext(selection)
+		}
+	}()
+	if candidates, ok := selection["spotify_search_uris"].([]string); kind != "playlist" && ok && len(candidates) > 0 {
 		return playSpotifySearch(ctx, selection, candidates)
 	}
-	resetSpotifyBeforePlay(ctx)
 	if !waitSpotifyReady(ctx, 5*time.Second) {
 		return M{"ok": false, "error": "Проигрыватель Spotify не отвечает."}
 	}
@@ -127,6 +137,9 @@ func playSpotifyNative(ctx context.Context, selection M, device, uri, kind strin
 		if attempt == 14 && !retried && status.Buffering && status.Track.URI == "" {
 			retried = true
 			_ = spotifyNativeCommand(ctx, "stop", M{})
+			if !waitSpotifyReady(ctx, 5*time.Second) {
+				return M{"ok": false, "error": "Проигрыватель Spotify не отвечает."}
+			}
 			if err := startPlay(); err != nil {
 				return M{"ok": false, "error": err.Error()}
 			}
@@ -192,8 +205,6 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 	requested, _ := selection["requested_track"].(string)
 	artist, _ := selection["requested_artist"].(string)
 	kind, _ := selection["music_type"].(string)
-	queueContext, _ := selection["spotify_search_context"].(bool)
-	resetSpotifyBeforePlay(ctx)
 	if !waitSpotifyReady(ctx, 5*time.Second) {
 		return M{"ok": false, "error": "Проигрыватель Spotify не отвечает."}
 	}
@@ -211,9 +222,6 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 	}
 	defer func() { _ = unmute() }()
 	limit := min(len(candidates), 5)
-	if queueContext {
-		limit = min(len(candidates), 3)
-	}
 	if kind == "album" {
 		limit = min(len(candidates), 2)
 	}
@@ -227,7 +235,7 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 		if ok {
 			sawTrack = true
 		}
-		if !ok || (!queueContext && !spotifySearchTrackMatches(kind, requested, artist, status.Track)) {
+		if !ok || !spotifySearchTrackMatches(kind, requested, artist, status.Track) {
 			log.Printf("spotify search rejected: uri=%s ok=%v name=%q artists=%v", candidates[i], ok, status.Track.Name, status.Track.ArtistNames)
 			continue
 		}
@@ -240,11 +248,6 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 				return M{"ok": false, "error": "Spotify не подтвердил воспроизведение альбома."}
 			}
 			status = album
-		}
-		if queueContext {
-			for j := i + 1; j < len(candidates) && j <= i+20; j++ {
-				_ = spotifyNativeCommand(ctx, "add_to_queue", M{"uri": candidates[j]})
-			}
 		}
 		playback := status.playback()
 		if err := unmute(); err != nil {

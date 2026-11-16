@@ -687,21 +687,33 @@ func (s *spotifyClient) resolve(request M) (result M) {
 		var library spotifyPlaylistPage
 		libraryErr := s.api("GET", "/me/playlists?limit=50", nil, &library)
 		if libraryErr == nil {
-			for _, playlist := range library.Items {
-				if strings.HasPrefix(playlist.URI, "spotify:playlist:") && playlist.URI != spotifyDJURI &&
-					playlist.Name != "" && spotifyPersonalPlaylist(playlist.Name) == "" &&
-					(s != directSpotify || playlist.Items.Total > 0) {
-					spokenQuery, _ := request["query"].(string)
-					selection := s.spotifySelection(&playlist, "playlist", playlist.Name, "", spokenQuery)
-					return s.withPlaylistTracks(selection, playlist.URI)
+			_, previous, _ := s.playbackContext()
+			if s == directSpotify {
+				native := readSpotifyNative()
+				if strings.HasPrefix(native.ContextURI, "spotify:playlist:") {
+					previous = native.ContextURI
 				}
 			}
-		}
-		if s == directSpotify {
-			if libraryErr != nil {
-				return M{"ok": false, "error": "Не удалось прочитать библиотеку Spotify на колонке."}
+			var selected *spotifyEntity
+			for i := range library.Items {
+				playlist := &library.Items[i]
+				if !strings.HasPrefix(playlist.URI, "spotify:playlist:") || playlist.URI == spotifyDJURI ||
+					playlist.Name == "" || spotifyPersonalPlaylist(playlist.Name) != "" ||
+					(s == directSpotify && playlist.Items.Total == 0) {
+					continue
+				}
+				selected = playlist
+				if playlist.URI != previous {
+					break
+				}
 			}
-			return M{"ok": false, "error": "В библиотеке Spotify нет доступного плейлиста. Добавьте плейлист и повторите команду."}
+			if selected != nil {
+				spokenQuery, _ := request["query"].(string)
+				return s.spotifySelection(selected, "playlist", selected.Name, "", spokenQuery)
+			}
+		}
+		if s == directSpotify && libraryErr != nil {
+			return M{"ok": false, "error": "Не удалось прочитать библиотеку Spotify на колонке."}
 		}
 		name, kind = "спокойная музыка", "playlist"
 	} else if artist == "" {
@@ -723,7 +735,7 @@ func (s *spotifyClient) resolve(request M) (result M) {
 					spokenQuery, _ := request["query"].(string)
 					selection := s.spotifySelection(&playlist, "playlist", playlist.Name, "", spokenQuery)
 					selection["context_type"] = "playlist"
-					return s.withPlaylistTracks(selection, playlist.URI)
+					return selection
 				}
 			}
 		}
@@ -792,18 +804,8 @@ func (s *spotifyClient) resolve(request M) (result M) {
 			selection["spotify_search_uris"] = uris
 			return selection
 		}
-		if discovery && personalMode == "" {
-			uris, err := spotifySearchURIs(context.Background(), theme)
-			if err != nil {
-				return M{"ok": false, "error": err.Error()}
-			}
-			selection := s.spotifySelection(&spotifyEntity{Name: theme, URI: uris[0]}, "playlist", theme, "", spokenQuery)
-			selection["spotify_search_uris"] = uris
-			selection["spotify_search_context"] = true
-			selection["spotify_shuffle"] = false
-			selection["context_type"] = "mood"
-			selection["context_name"] = name
-			return selection
+		if kind == "playlist" && personalMode == "" {
+			return s.resolvePairedPlaylist(name, theme, spokenQuery, discovery)
 		}
 	}
 	query := name
@@ -816,23 +818,24 @@ func (s *spotifyClient) resolve(request M) (result M) {
 	var found []spotifyEntity
 
 	if kind == "playlist" && !discovery && personalMode == "" {
+		requestedKey := musicKey(name)
 		for offset := 0; offset < 1000; offset += 50 {
 			var own spotifyPlaylistPage
 			if s.api("GET", fmt.Sprintf("/me/playlists?limit=50&offset=%d", offset), nil, &own) != nil {
 				break
 			}
-			for _, p := range own.Items {
-				if musicKey(p.Name) == musicKey(name) {
-					found = append(found, p)
+			for _, playlist := range own.Items {
+				if strings.HasPrefix(playlist.URI, "spotify:playlist:") && musicKey(playlist.Name) == requestedKey {
+					found = append(found, playlist)
 				}
 			}
-			if len(found) > 0 || own.Next == "" || len(own.Items) == 0 {
+			if len(found) > 0 {
+				break
+			}
+			if own.Next == "" || len(own.Items) == 0 {
 				break
 			}
 		}
-	}
-	if s == directSpotify && kind == "playlist" && !discovery && personalMode == "" && len(found) == 0 {
-		return M{"ok": false, "error": "Плейлист «" + name + "» не найден в библиотеке Spotify. Добавьте его и повторите команду."}
 	}
 	queries := []string{query}
 	switch personalMode {
@@ -1064,23 +1067,123 @@ func (s *spotifyClient) resolve(request M) (result M) {
 		return M{"ok": false, "error": "Точного совпадения в Spotify не нашёл; уточни название. Другой трек не подставляю."}
 	}
 	spokenQuery, _ := request["query"].(string)
-	selection := s.spotifySelection(selected, kind, name, artist, spokenQuery)
-	if kind == "playlist" && s == directSpotify {
-		return s.withPlaylistTracks(selection, selected.URI)
-	}
-	return selection
+	return s.spotifySelection(selected, kind, name, artist, spokenQuery)
 }
 
-func (s *spotifyClient) withPlaylistTracks(selection M, uri string) M {
-	if s != directSpotify || uri == spotifyDJURI {
-		return selection
+func (s *spotifyClient) resolvePairedPlaylist(name, theme, spokenQuery string, discovery bool) M {
+	var library []spotifyEntity
+	complete := false
+	for offset := 0; offset < 1000; offset += 50 {
+		var page spotifyPlaylistPage
+		if err := s.api(http.MethodGet, fmt.Sprintf("/me/playlists?limit=50&offset=%d", offset), nil, &page); err != nil {
+			return M{"ok": false, "error": "Не удалось прочитать библиотеку Spotify на колонке."}
+		}
+		library = append(library, page.Items...)
+		if page.Next == "" || len(page.Items) == 0 {
+			complete = true
+			break
+		}
 	}
-	uris, err := spotifyPlaylistTrackURIs(context.Background(), uri)
-	if err == nil && len(uris) > 0 {
-		selection["spotify_search_uris"] = uris
-		selection["spotify_search_context"] = true
+	match := func(items []spotifyEntity) (*spotifyEntity, *spotifyEntity) {
+		if discovery {
+			return matchSpotifyMoodPlaylist(name, theme, items), nil
+		}
+		return closestSpotifyPlaylist(name, items)
 	}
-	return selection
+	selected, alternative := match(library)
+	if alternative != nil {
+		return M{"ok": false, "error": fmt.Sprintf("В библиотеке есть похожие плейлисты «%s» и «%s». Уточни название.", selected.Name, alternative.Name)}
+	}
+	if selected == nil {
+		if !complete {
+			return M{"ok": false, "error": "Не удалось проверить все плейлисты в библиотеке Spotify."}
+		}
+		query := name
+		if discovery && strings.TrimSpace(theme) != "" {
+			query = theme
+		}
+		items, err := pairedSpotifyCatalogPlaylists(context.Background(), query)
+		if err != nil {
+			log.Println("Spotify catalog search:", clean(err))
+			return M{"ok": false, "error": "Не удалось выполнить поиск плейлистов в каталоге Spotify."}
+		}
+		selected, alternative = match(items)
+		if alternative != nil {
+			return M{"ok": false, "error": fmt.Sprintf("В Spotify есть похожие плейлисты «%s» и «%s». Уточни название.", selected.Name, alternative.Name)}
+		}
+		if selected == nil {
+			return M{"ok": false, "error": "Подходящий плейлист не найден ни в библиотеке, ни в каталоге Spotify."}
+		}
+		log.Printf("Spotify catalog playlist selected: %q -> %q", query, selected.Name)
+	}
+	return s.spotifySelection(selected, "playlist", selected.Name, "", spokenQuery)
+}
+
+func closestSpotifyPlaylist(requested string, library []spotifyEntity) (best, alternative *spotifyEntity) {
+	key := []rune(musicKey(requested))
+	if len(key) == 0 {
+		return nil, nil
+	}
+	// Allow common transcription errors in longer titles. A shared last word
+	// or one typo in a very short title should not select another playlist.
+	limit := min(5, len(key)/5)
+	bestDistance, nextDistance := limit+1, limit+1
+	seen := make(map[string]bool)
+	for i := range library {
+		playlist := &library[i]
+		if !strings.HasPrefix(playlist.URI, "spotify:playlist:") || seen[playlist.URI] {
+			continue
+		}
+		seen[playlist.URI] = true
+		title := []rune(musicKey(playlist.Name))
+		if len(title) == 0 || len(title) > len(key)+limit || len(title)+limit < len(key) {
+			continue
+		}
+		distance := musicTitleDistance(key, title)
+		if distance == 0 {
+			return playlist, nil
+		}
+		if distance < bestDistance {
+			alternative, nextDistance = best, bestDistance
+			best, bestDistance = playlist, distance
+		} else if distance < nextDistance {
+			alternative, nextDistance = playlist, distance
+		}
+	}
+	if nextDistance > bestDistance+1 {
+		alternative = nil
+	}
+	return best, alternative
+}
+
+func matchSpotifyMoodPlaylist(request, theme string, library []spotifyEntity) *spotifyEntity {
+	requestKey := musicKey(request)
+	var best *spotifyEntity
+	bestScore := 0
+	for i := range library {
+		playlist := &library[i]
+		if !strings.HasPrefix(playlist.URI, "spotify:playlist:") || playlist.URI == spotifyDJURI ||
+			strings.TrimSpace(playlist.Name) == "" || spotifyPersonalPlaylist(playlist.Name) != "" {
+			continue
+		}
+		if requestKey != "" && musicKey(playlist.Name) == requestKey {
+			return playlist
+		}
+		score := spotifyMoodScore(theme, playlist.Name)
+		if score == 0 || !spotifyMoodGenreMatches(theme, request, playlist.Name) {
+			continue
+		}
+		if playlist.Items.Total > 0 {
+			score += 2
+		}
+		if strings.EqualFold(playlist.Owner.ID, "spotify") {
+			score++
+		}
+		if score > bestScore {
+			best, bestScore = playlist, score
+		}
+	}
+	return best
 }
 
 func (s *spotifyClient) spotifySelection(selected *spotifyEntity, kind, name, artist, query string) M {
