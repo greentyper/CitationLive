@@ -2429,7 +2429,7 @@ func main() {
 		mode = os.Args[1]
 	}
 	if mode == "info" {
-		fmt.Println(`{"native":true,"architecture":"` + runtime.GOARCH + `","glibc_required":false}`)
+		fmt.Printf(`{"native":true,"architecture":%q,"glibc_required":false,"go_version":%q}`+"\n", runtime.GOARCH, runtime.Version())
 		return
 	}
 	if mode == "clean-ipc" {
