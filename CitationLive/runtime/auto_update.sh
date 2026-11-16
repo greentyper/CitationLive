@@ -37,19 +37,37 @@ daemon_pid() {
     printf '%s\n' "$pid"
 }
 
+clear_rollback() {
+    # Clear the transaction before dropping its backup. If interrupted, the
+    # backup can be discarded on the next boot or check.
+    rm -f "$state/pending" && rm -f "$state/previous"
+}
+
+clear_staging() {
+    rm -f "$state/candidate" "$state/pending.new" "$state/previous.new" "$state/restore"
+}
+
 restore_previous() {
-    test -f "$state/pending" || return 0
     read -r name < "$state/pending"
     case "$name" in citationvoice|citationvoice.real) ;; *) return 1 ;; esac
     live=$bin/$name
     failed_pid=$(daemon_pid "$live" || true)
     ln -f "$state/previous" "$state/restore" &&
-        mv -f "$state/restore" "$live" &&
-        rm -f "$state/pending" || return 1
+        mv -f "$state/restore" "$live" || return 1
     if test -n "$failed_pid"; then
         kill -TERM "$failed_pid" 2>/dev/null || true
     fi
+    clear_rollback || return 1
     printf '%s\n' 'Restored previous CitationLive executable.'
+}
+
+recover_update() {
+    if test -f "$state/pending"; then
+        restore_previous || return 1
+    else
+        rm -f "$state/previous" || return 1
+    fi
+    clear_staging
 }
 
 github_get() {
@@ -104,7 +122,7 @@ restart_spotify_helpers() {
 check() {
     enabled && test ! -e "$app/disabled" || return 0
     lock_update || return 0
-    restore_previous
+    recover_update
     speaker_idle || return 0
 
     name=citationvoice
@@ -121,9 +139,8 @@ check() {
     test "$sha" != "$(cat "$state/rejected" 2>/dev/null || true)" || return 0
 
     candidate=$state/candidate
-    applying=no
     cleanup() {
-        if test "$applying" = yes; then
+        if test -f "$state/pending"; then
             if restore_previous; then
                 printf '%s\n' "$sha" > "$state/rejected"
                 restart_spotify_helpers || true
@@ -131,7 +148,7 @@ check() {
                 echo 'CitationLive rollback failed; recovery will retry.' >&2
             fi
         fi
-        rm -f "$candidate" "$state/pending.new" "$state/previous.new"
+        clear_staging
     }
     trap cleanup EXIT
     trap 'exit 1' HUP INT TERM
@@ -148,13 +165,11 @@ check() {
     mv -f "$state/previous.new" "$state/previous"
     printf '%s\n' "$name" > "$state/pending.new"
     mv -f "$state/pending.new" "$state/pending"
-    applying=yes
     mv -f "$candidate" "$target"
     kill -TERM "$live_pid"
     wait_ready "$target" "$live_pid"
     restart_spotify_helpers
-    rm -f "$state/pending"
-    applying=no
+    clear_rollback
     rm -f "$state/rejected"
     printf 'Updated CitationLive to GitHub blob %s\n' "$sha"
 }
@@ -178,8 +193,8 @@ case "${1:-}" in
         if enabled; then echo enabled; else echo disabled; fi
         ;;
     boot)
-        if test -f "$state/pending" && lock_update; then
-            restore_previous
+        if test -d "$state" && lock_update; then
+            recover_update
         fi
         schedule
         ;;
