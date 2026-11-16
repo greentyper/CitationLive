@@ -6,6 +6,7 @@ app="/data/opt/citation-gemini"
 state_dir="$app/state"
 bin_dir="$app/bin"
 home_dir="/data/home/chrome"
+daemon_pid_file=/run/citationlive-daemon.pid
 
 # Ensure runtime state directory exists before redirecting logs
 mkdir -p "$state_dir"
@@ -89,7 +90,7 @@ stop_native() {
         kill "$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
     fi
-    rm -f "$pid_file" 2>/dev/null || true
+    rm -f "$pid_file" "$daemon_pid_file" 2>/dev/null || true
     exit 0
 }
 trap stop_native TERM INT
@@ -117,6 +118,10 @@ while ! netstat -tl 2>/dev/null | grep -q :9998; do
 done
 
 echo "[$(date '+%Y-%m-%d %H:%M:%S')] Supervisor initialized (PID $$), starting daemon loop: $daemon"
+
+if [ -f "$bin_dir/auto_update.sh" ]; then
+    /bin/sh "$bin_dir/auto_update.sh" boot 200>&- || echo "CitationLive auto-update could not start"
+fi
 
 if [ -f "$bin_dir/ensure_spotify_connect.sh" ]; then
     /bin/sh "$bin_dir/ensure_spotify_connect.sh" 200>&- || echo "Native Spotify Connect unavailable"
@@ -157,9 +162,11 @@ while [ ! -f "$app/disabled" ]; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting $daemon serve..."
     "$daemon" serve "$app/config.json" 200>&- &
     child=$!
+    printf '%s\n' "$child" > "$daemon_pid_file"
     monitor_native_capture "$child" 200>&- &
     capture_monitor=$!
     wait "$child" || true
+    rm -f "$daemon_pid_file"
     kill "$capture_monitor" 2>/dev/null || true
     wait "$capture_monitor" 2>/dev/null || true
     capture_monitor=

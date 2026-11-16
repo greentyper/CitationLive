@@ -399,7 +399,7 @@ def check_prerequisites():
         errors.append("Не найден dist/citationvoice")
 
     for relative in ('dist/iot_audio_capture48k', 'dist/libassistant.hotword-observe-v3.so',
-                     'runtime/supervise.sh', 'runtime/alsa_looper.sh',
+                     'runtime/supervise.sh', 'runtime/alsa_looper.sh', 'runtime/auto_update.sh',
                      'runtime/ensure_native_capture.sh', 'runtime/ensure_early_hotword.sh',
                      'config.example.json'):
         if not (ROOT / relative).is_file():
@@ -594,6 +594,49 @@ def create_install_backup(adb_serial):
         return False
 
 
+AUTO_UPDATE_SCRIPT = '/data/opt/citation-gemini/bin/auto_update.sh'
+
+
+def configure_auto_updates(adb_serial, offer=False):
+    def run(action):
+        return deploy_run(
+            [str(ADB), '-s', adb_serial, 'shell',
+             f'test -f {AUTO_UPDATE_SCRIPT} && /bin/sh {AUTO_UPDATE_SCRIPT} {action}'],
+            text=True, errors='replace', timeout=15
+        ).stdout.strip()
+
+    try:
+        status = run('status')
+        if offer and status == 'enabled':
+            return
+        if not offer:
+            print(ui('Автообновления включены.' if status == 'enabled' else 'Автообновления выключены.',
+                     'Automatic updates are on.' if status == 'enabled' else 'Automatic updates are off.'))
+        print(ui('Колонка будет проверять новые версии citationvoice в GitHub main раз в 6 часов и устанавливать их в простое.',
+                 'The speaker checks GitHub main for new citationvoice builds every 6 hours and installs them when idle.'))
+        prompt = (ui('Включить автообновления? [y/N]: ', 'Enable automatic updates? [y/N]: ') if offer else
+                  ui('Включить [y], выключить [n], оставить как есть [Enter]: ',
+                     'Enable [y], disable [n], keep current setting [Enter]: '))
+        while True:
+            answer = input(prompt).strip().lower()
+            if answer in ('y', 'yes', 'д', 'да'):
+                run('enable')
+                log(ui('Автообновления включены.', 'Automatic updates enabled.'), 'OK')
+                return
+            if answer in ('n', 'no', 'н', 'нет'):
+                if not offer:
+                    run('disable')
+                    log(ui('Автообновления выключены.', 'Automatic updates disabled.'), 'OK')
+                return
+            if not answer:
+                return
+    except EOFError:
+        return
+    except (subprocess.SubprocessError, OSError):
+        log(ui('Не удалось настроить автообновления. Проверьте подключение и версию CitationLive.',
+               'Could not configure automatic updates. Check the connection and CitationLive version.'), 'ERR')
+
+
 def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemini-3.8-live", force=False):
     """Step 4: Deploy Gemini voice assistant to /data over ADB."""
     print("\n" + "="*67)
@@ -637,13 +680,20 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
         city_input = input("Введите ваш город: ").strip()
     log(f"Установлен домашний город: {city_input}", 'OK')
 
+    deploy_run([str(ADB), '-s', adb_serial, 'shell',
+                'systemctl stop citationlive-autoupdate.timer citationlive-autoupdate.service >/dev/null 2>&1 || true; '
+                '! systemctl is-active --quiet citationlive-autoupdate.service'],
+               capture_output=True)
+
     log("Создание резервной копии существующей установки...", 'INFO')
     if not create_install_backup(adb_serial):
         return False
 
     log("Создание структуры каталогов /data/opt/citation-gemini...", 'INFO')
     deploy_run([str(ADB), '-s', adb_serial, 'shell',
-                    'mkdir -p /data/opt/citation-gemini/bin /data/opt/citation-gemini/state /data/opt/citation-gemini/cues /data/opt/citation-gemini/led /data/home/chrome'],
+                    'mkdir -p /data/opt/citation-gemini/bin /data/opt/citation-gemini/state /data/opt/citation-gemini/cues /data/opt/citation-gemini/led /data/home/chrome && '
+                    'chown root:root /data/opt/citation-gemini /data/opt/citation-gemini/bin && '
+                    'chmod 755 /data/opt/citation-gemini /data/opt/citation-gemini/bin'],
                    capture_output=True)
 
     log("Копирование исполняемых файлов на колонку...", 'INFO')
@@ -671,7 +721,8 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
         deploy_run([str(ADB), '-s', adb_serial, 'push', str(hot_so), '/data/opt/citation-gemini/bin/libassistant.hotword-observe-v3.so'], capture_output=True)
 
     runtime_dir = ROOT / 'runtime'
-    for sh in ['supervise.sh', 'ensure_native_capture.sh', 'ensure_early_hotword.sh', 'ensure_spotify_connect.sh', 'ensure_cast_spotify_filter.sh']:
+    for sh in ['supervise.sh', 'auto_update.sh', 'ensure_native_capture.sh', 'ensure_early_hotword.sh',
+               'ensure_spotify_connect.sh', 'ensure_cast_spotify_filter.sh']:
         sh_file = runtime_dir / sh
         if sh_file.is_file():
             deploy_run([str(ADB), '-s', adb_serial, 'push', str(sh_file), f'/data/opt/citation-gemini/bin/{sh}'], capture_output=True)
@@ -799,6 +850,7 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
     else:
         log("Служба не подтвердила готовность за 90 секунд. Проверьте service.log и Cast-приёмник (порт 18768).", 'ERR')
         return False
+    configure_auto_updates(adb_serial, offer=True)
     return True
 
 def setup_spotify(adb_serial):
@@ -1398,18 +1450,18 @@ def interactive_menu(target_ip=None):
                  '     Дополнительные настройки:\n'
                  ' [5] Подключить Spotify\n [6] Подключить Google Календарь и Задачи\n'
                  ' [7] Google News — лента из аккаунта\n [8] Настроить DNS / прокси Gemini\n'
-                 ' [9] Выбрать другую колонку\n [10] Веб-авторизация Google News\n [0] Выход',
+                 ' [9] Выбрать другую колонку\n [10] Веб-авторизация Google News\n [11] Автообновления CitationLive\n [0] Выход',
                  ' [1] All in one — Gemini, Spotify, Google and News\n'
                  ' [2] Check speaker connection\n [3] Connect speaker / enable network access\n'
                  ' [4] Reinstall CitationLive\n     Optional services:\n'
                  ' [5] Connect Spotify\n [6] Connect Google Calendar and Tasks\n'
                  ' [7] Google News — account feed\n [8] Configure Gemini DNS / proxy\n'
-                 ' [9] Select another speaker\n [10] Google News browser sign-in\n [0] Exit'))
-        choice = input(ui('Выберите пункт [0–10]: ', 'Choose [0–10]: ')).strip()
+                 ' [9] Select another speaker\n [10] Google News browser sign-in\n [11] CitationLive automatic updates\n [0] Exit'))
+        choice = input(ui('Выберите пункт [0–11]: ', 'Choose [0–11]: ')).strip()
         if choice == '0':
             return
-        if not choice.isdigit() or not (0 <= int(choice) <= 10):
-            print(ui('Введите номер пункта от 0 до 10.', 'Enter a number from 0 to 10.'))
+        if not choice.isdigit() or not (0 <= int(choice) <= 11):
+            print(ui('Введите номер пункта от 0 до 11.', 'Enter a number from 0 to 11.'))
             continue
         choice = str(int(choice))
         if choice == '9' or not target_ip:
@@ -1458,6 +1510,8 @@ def interactive_menu(target_ip=None):
                 setup_google_news(ident)
             elif choice == '8':
                 configure_dns(target_ip)
+            elif choice == '11':
+                configure_auto_updates(ident)
         except (subprocess.SubprocessError, OSError) as exc:
             print(ui('Операция прервана. Проверьте соединение с колонкой и повторите пункт меню.',
                      'Operation interrupted. Check the speaker connection and retry the menu option.'))

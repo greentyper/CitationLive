@@ -49,6 +49,9 @@ python .\CitationLive\citation_tool.py run --ip 192.168.1.100 --lang en
 | **[7]** | Manage the personalized Google News feed, including checking and clearing its saved session. |
 | **[8]** | Configure DNS or a proxy for Gemini. |
 | **[10]** | Sign in to Google News with Chrome or Edge. The wizard offers to install Playwright on first use. |
+| **[11]** | Enable or disable CitationLive automatic updates. |
+
+After installation, the wizard offers automatic updates. If enabled, the speaker checks the `main` branch for a new `citationvoice` binary about every 6 hours. It waits until Gemini and Spotify are idle and restores the previous build if the new process fails to start. Use option **[4]** to update the installer and system components.
 
 [Network ADB security](SECURITY.md) (Russian)
 
