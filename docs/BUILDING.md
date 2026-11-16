@@ -43,3 +43,5 @@ python -B scripts/package_release.py
 
 The package command writes the ZIP and SHA256SUMS.txt to the parent directory
 and updates MANIFEST.sha256 in this repository. It does not rebuild Go.
+
+On GitHub, [Build CitationLive for ARM](../.github/workflows/build-citationvoice.yml) tests changes to the Go module on `main`, builds the ARM binary, and commits it if its bytes change. Speakers with automatic updates enabled download that binary at their next check.
