@@ -188,9 +188,7 @@ func (m *timerScheduler) start() {
 
 	_ = m.load()
 	m.mu.Lock()
-	now := m.now()
-	m.recomputeAlarmsLocked(now)
-	m.lastTick = now
+	m.lastTick = m.now()
 	m.mu.Unlock()
 
 	go m.loop()

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -65,13 +66,17 @@ func (m *memoryStore) loadLocked() {
 	}
 }
 
-func (m *memoryStore) saveLocked() error {
-	file := memoryFile{Version: memoryFileVersion, Entries: m.entries}
+func (m *memoryStore) saveLocked(entries []MemoryEntry) error {
+	file := memoryFile{Version: memoryFileVersion, Entries: entries}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(m.path, data, 0600)
+	if err := writeAtomicFile(m.path, data, 0600); err != nil {
+		return err
+	}
+	m.entries = entries
+	return nil
 }
 
 func normalizeMemoryText(s string) string {
@@ -91,29 +96,30 @@ func (m *memoryStore) Add(text, category string) (MemoryEntry, error) {
 	key := normalizeMemoryText(text)
 	for i := range m.entries {
 		if normalizeMemoryText(m.entries[i].Text) == key {
-			m.entries[i].Category = category
-			m.entries[i].Updated = now
-			if err := m.saveLocked(); err != nil {
+			entries := slices.Clone(m.entries)
+			entries[i].Category = category
+			entries[i].Updated = now
+			if err := m.saveLocked(entries); err != nil {
 				return MemoryEntry{}, err
 			}
-			return m.entries[i], nil
+			return entries[i], nil
 		}
 	}
-	m.seq++
 	entry := MemoryEntry{
-		ID:       fmt.Sprintf("m%d", m.seq),
+		ID:       fmt.Sprintf("m%d", m.seq+1),
 		Text:     text,
 		Category: category,
 		Created:  now,
 		Updated:  now,
 	}
-	m.entries = append(m.entries, entry)
-	if len(m.entries) > 200 {
-		m.entries = m.entries[len(m.entries)-200:]
+	entries := append(slices.Clone(m.entries), entry)
+	if len(entries) > 200 {
+		entries = entries[len(entries)-200:]
 	}
-	if err := m.saveLocked(); err != nil {
+	if err := m.saveLocked(entries); err != nil {
 		return MemoryEntry{}, err
 	}
+	m.seq++
 	return entry, nil
 }
 
@@ -138,7 +144,7 @@ func (m *memoryStore) Delete(id, text string) (int, error) {
 	defer m.mu.Unlock()
 	m.loadLocked()
 	key := normalizeMemoryText(text)
-	kept := m.entries[:0]
+	kept := make([]MemoryEntry, 0, len(m.entries))
 	deleted := 0
 	for _, entry := range m.entries {
 		match := id != "" && entry.ID == id
@@ -151,9 +157,8 @@ func (m *memoryStore) Delete(id, text string) (int, error) {
 		}
 		kept = append(kept, entry)
 	}
-	m.entries = kept
 	if deleted > 0 {
-		if err := m.saveLocked(); err != nil {
+		if err := m.saveLocked(kept); err != nil {
 			return 0, err
 		}
 	}

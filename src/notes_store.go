@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -77,13 +78,17 @@ func (m *notesStore) loadLocked() {
 	}
 }
 
-func (m *notesStore) saveLocked() error {
-	file := notesFile{Version: notesFileVersion, Notes: m.notes}
+func (m *notesStore) saveLocked(notes []Note) error {
+	file := notesFile{Version: notesFileVersion, Notes: notes}
 	data, err := json.MarshalIndent(file, "", "  ")
 	if err != nil {
 		return err
 	}
-	return writeAtomicFile(m.path, data, 0600)
+	if err := writeAtomicFile(m.path, data, 0600); err != nil {
+		return err
+	}
+	m.notes = notes
+	return nil
 }
 
 func normalizeNoteKey(s string) string {
@@ -146,18 +151,17 @@ func (m *notesStore) Create(title, body string) (Note, error) {
 	if len(m.notes) >= maxNotes {
 		return Note{}, fmt.Errorf("note limit reached (%d)", maxNotes)
 	}
-	m.seq++
 	note := Note{
-		ID:      fmt.Sprintf("n%d", m.seq),
+		ID:      fmt.Sprintf("n%d", m.seq+1),
 		Title:   title,
 		Body:    body,
 		Created: now,
 		Updated: now,
 	}
-	m.notes = append(m.notes, note)
-	if err := m.saveLocked(); err != nil {
+	if err := m.saveLocked(append(slices.Clone(m.notes), note)); err != nil {
 		return Note{}, err
 	}
+	m.seq++
 	return cloneNote(note), nil
 }
 
@@ -202,12 +206,15 @@ func (m *notesStore) AddItem(id, title, text string) (Note, int, error) {
 	if len(m.notes[index].Items) >= maxNoteItems {
 		return Note{}, 0, fmt.Errorf("note item limit reached (%d)", maxNoteItems)
 	}
-	m.notes[index].Items = append(m.notes[index].Items, NoteItem{Text: text})
-	m.notes[index].Updated = now
-	if err := m.saveLocked(); err != nil {
+	note := cloneNote(m.notes[index])
+	note.Items = append(note.Items, NoteItem{Text: text})
+	note.Updated = now
+	notes := slices.Clone(m.notes)
+	notes[index] = note
+	if err := m.saveLocked(notes); err != nil {
 		return Note{}, 0, err
 	}
-	return cloneNote(m.notes[index]), len(m.notes[index].Items), nil
+	return cloneNote(note), len(note.Items), nil
 }
 
 func (m *notesStore) findItemLocked(note Note, text string, index int) (int, error) {
@@ -255,15 +262,18 @@ func (m *notesStore) CompleteItem(id, title, text string, index int) (Note, int,
 	if err != nil {
 		return Note{}, 0, false, err
 	}
-	alreadyDone := m.notes[noteIndex].Items[itemIndex].Done
-	m.notes[noteIndex].Items[itemIndex].Done = true
+	note := cloneNote(m.notes[noteIndex])
+	alreadyDone := note.Items[itemIndex].Done
 	if !alreadyDone {
-		m.notes[noteIndex].Updated = now
-		if err := m.saveLocked(); err != nil {
+		note.Items[itemIndex].Done = true
+		note.Updated = now
+		notes := slices.Clone(m.notes)
+		notes[noteIndex] = note
+		if err := m.saveLocked(notes); err != nil {
 			return Note{}, 0, false, err
 		}
 	}
-	return cloneNote(m.notes[noteIndex]), itemIndex + 1, alreadyDone, nil
+	return cloneNote(note), itemIndex + 1, alreadyDone, nil
 }
 
 func (m *notesStore) Delete(id, title string) (Note, error) {
@@ -275,8 +285,8 @@ func (m *notesStore) Delete(id, title string) (Note, error) {
 		return Note{}, err
 	}
 	deleted := cloneNote(m.notes[index])
-	m.notes = append(m.notes[:index], m.notes[index+1:]...)
-	if err := m.saveLocked(); err != nil {
+	notes := slices.Delete(slices.Clone(m.notes), index, index+1)
+	if err := m.saveLocked(notes); err != nil {
 		return Note{}, err
 	}
 	return deleted, nil
@@ -291,9 +301,10 @@ func (m *notesStore) SetRemote(id, remoteID, remoteList string) (Note, error) {
 	if err != nil {
 		return Note{}, err
 	}
-	m.notes[index].RemoteID = strings.TrimSpace(remoteID)
-	m.notes[index].RemoteList = strings.TrimSpace(remoteList)
-	if err := m.saveLocked(); err != nil {
+	notes := slices.Clone(m.notes)
+	notes[index].RemoteID = strings.TrimSpace(remoteID)
+	notes[index].RemoteList = strings.TrimSpace(remoteList)
+	if err := m.saveLocked(notes); err != nil {
 		return Note{}, err
 	}
 	return cloneNote(m.notes[index]), nil
@@ -381,8 +392,7 @@ func (m *notesStore) MergeRemote(tasks []GoogleTask, list string) ([]Note, error
 		})
 		merged = merged[:maxNotes]
 	}
-	m.notes = merged
-	err := m.saveLocked()
+	err := m.saveLocked(merged)
 	out := make([]Note, 0, len(merged))
 	for _, note := range merged {
 		out = append(out, cloneNote(note))

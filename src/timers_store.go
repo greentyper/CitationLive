@@ -71,9 +71,9 @@ func (m *timerScheduler) load() error {
 		if len(alarm.RepeatDays) == 0 && wasActive && alarm.Next == 0 && alarm.SnoozeUntil == 0 {
 			continue
 		}
-		// Keep an expired snooze so collectDue rings it once, then the normal
-		// schedule resumes.
-		if alarm.SnoozeUntil == 0 || alarm.SnoozeUntil > now.UnixNano() {
+		// Keep pending one-shot deadlines and snoozes even if they elapsed while
+		// the scheduler was down. Recurring alarms resume their normal schedule.
+		if alarm.SnoozeUntil == 0 && (len(alarm.RepeatDays) > 0 || alarm.Next <= 0) {
 			alarm.Next = nextAlarmOccurrence(now, alarm.Hour, alarm.Minute, alarm.RepeatDays).UnixNano()
 		}
 		m.alarms = append(m.alarms, alarm)
