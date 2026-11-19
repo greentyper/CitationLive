@@ -124,7 +124,7 @@ func handleEcosystemTool(ctx context.Context, name string, args M) (M, bool) {
 			timerArgs["in_seconds"] = v
 		}
 		res := timerManager.toolSetReminder(timerArgs)
-		res["instruction"] = "Коротко подтверди по-русски. Если source=local или offline, скажи, что напоминание создано локально и синхронизируется с Google после авторизации. Если source=task или calendar, скажи, что оно в Google."
+		res["instruction"] = "Подтверди создание, если ok=true. Если source=local или offline, скажи, что напоминание сохранено на колонке. Если source=task и синхронизация успешна, скажи, что оно в Google Tasks."
 		return res, true
 	case "create_calendar_event":
 		if !personalAccessOK() {
@@ -149,7 +149,7 @@ func handleEcosystemTool(ctx context.Context, name string, args M) (M, bool) {
 			timerArgs["in_seconds"] = v
 		}
 		res := timerManager.toolSetReminder(timerArgs)
-		res["instruction"] = "Коротко подтверди по-русски, что событие добавлено. Если source=local или offline, скажи, что создано локально и синхронизируется с Google после авторизации. Если source=calendar, скажи, что оно в Google Calendar."
+		res["instruction"] = "Подтверди создание, если ok=true. Если source=local или offline, скажи, что событие сохранено на колонке. Если source=calendar и синхронизация успешна, скажи, что оно в Google Calendar."
 		return res, true
 	default:
 		return nil, false

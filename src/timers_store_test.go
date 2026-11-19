@@ -7,6 +7,59 @@ import (
 	"time"
 )
 
+func TestLocalAgendaFiltersByDayAndItemKind(t *testing.T) {
+	preferenceState.Lock()
+	previousZone := preferenceState.Timezone
+	preferenceState.Timezone = "Asia/Novosibirsk"
+	preferenceState.Unlock()
+	t.Cleanup(func() {
+		preferenceState.Lock()
+		preferenceState.Timezone = previousZone
+		preferenceState.Unlock()
+	})
+
+	dir := t.TempDir()
+	now := time.Date(2026, time.November, 20, 17, 30, 0, 0, time.UTC)
+	newScheduler := func() *timerScheduler {
+		scheduler := newTimerScheduler(filepath.Join(dir, "timers.json"), newJSONFileReminderBackend(filepath.Join(dir, "reminders.json")))
+		scheduler.now = func() time.Time { return now }
+		return scheduler
+	}
+	scheduler := newScheduler()
+	for _, args := range []M{
+		{"text": "Today event", "at": "09:00", "remote_kind": "event"},
+		{"text": "Today task", "at": "2026-11-21T10:00:00+07:00"},
+		{"text": "Tomorrow event", "at": "2026-11-22T00:00:00+07:00", "remote_kind": "event"},
+	} {
+		if got := scheduler.toolSetReminder(args); got["ok"] != true {
+			t.Fatalf("create local item: %+v", got)
+		}
+	}
+
+	reloaded := newScheduler()
+	if err := reloaded.load(); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		args M
+		want string
+		at   string
+	}{
+		{M{"date": "today", "kind": "event"}, "Today event", "2026-11-21T09:00:00+07:00"},
+		{M{"date": "2026-11-21", "kind": "task"}, "Today task", "2026-11-21T10:00:00+07:00"},
+		{M{"date": "tomorrow"}, "Tomorrow event", "2026-11-22T00:00:00+07:00"},
+	} {
+		result, _ := handleTimerToolOn(reloaded, "list_reminders", test.args)
+		items, _ := result["reminders"].([]M)
+		if len(items) != 1 || items[0]["text"] != test.want || items[0]["at"] != test.at {
+			t.Errorf("list with %v returned %+v", test.args, result)
+		}
+	}
+	if result, _ := handleTimerToolOn(reloaded, "list_reminders", M{}); result["count"] != 3 {
+		t.Errorf("unfiltered list returned %+v", result)
+	}
+}
+
 func TestPendingReminderDeletionKeepsOneTombstone(t *testing.T) {
 	reminder := Reminder{ID: "r1", Text: "Reminder"}
 	pending := reminderRecord{Reminder: reminder, Deleted: true, Pending: true}

@@ -735,20 +735,23 @@ func timerToolDeclarations() []M {
 		},
 		{
 			"name":        "set_reminder",
-			"description": "Create or update a reminder with text at a time. Reminders synchronise with Google Calendar/Tasks when configured. at accepts HH:MM, RFC3339 with offset, or 'YYYY-MM-DD HH:MM'; use get_time's iso/local_iso and never append Z to a local time. in_seconds is an alternative. remote_kind=event creates a Google Calendar event instead of a task.",
+			"description": "Create or update a task or calendar event with text and a time. Items are saved locally when Google sync is unavailable. at accepts HH:MM, RFC3339 with offset, or 'YYYY-MM-DD HH:MM'. in_seconds is an alternative. Use remote_kind=event for a calendar event.",
 			"parameters": M{"type": "OBJECT", "properties": M{
 				"text":        M{"type": "STRING", "description": "What to remind the user about."},
 				"at":          M{"type": "STRING", "description": "HH:MM, RFC3339, or YYYY-MM-DD HH:MM."},
 				"in_seconds":  M{"type": "INTEGER", "description": "Alternative relative delay in seconds."},
 				"date":        M{"type": "STRING", "description": "Optional YYYY-MM-DD used with a HH:MM time."},
 				"id":          M{"type": "STRING", "description": "Existing reminder id to update instead of creating a new one."},
-				"remote_kind": M{"type": "STRING", "enum": []string{"task", "event"}, "description": "task (default) or event for Google Calendar."},
+				"remote_kind": M{"type": "STRING", "enum": []string{"task", "event"}, "description": "Task (default) or calendar event."},
 			}},
 		},
 		{
 			"name":        "list_reminders",
-			"description": "List reminders. `at` is local RFC3339 with offset; `at_utc` is UTC; each item also has `local_time`, `local_date`, `weekday`, `timezone`, `when` and `local_iso`. Always speak the local fields. Shows local pending changes when Google Calendar/Tasks is offline.",
-			"parameters":  empty,
+			"description": "List tasks and calendar events, including local entries without a Google account. Use date for a daily agenda or kind to list only events or only tasks. Speak local_time and local_date.",
+			"parameters": M{"type": "OBJECT", "properties": M{
+				"date": M{"type": "STRING", "description": "Optional date in the speaker's timezone: today, tomorrow, or YYYY-MM-DD."},
+				"kind": M{"type": "STRING", "enum": []string{"task", "event"}, "description": "Optional item type. Omit for both."},
+			}},
 		},
 		{
 			"name":        "cancel_reminder",
@@ -857,7 +860,7 @@ func handleTimerToolOn(m *timerScheduler, name string, args M) (M, bool) {
 	case "set_reminder":
 		return m.toolSetReminder(args), true
 	case "list_reminders":
-		return m.toolListReminders(), true
+		return m.toolListReminders(args), true
 	case "cancel_reminder":
 		return m.toolCancelReminder(args), true
 	case "sync_reminders":
@@ -1214,12 +1217,12 @@ func (m *timerScheduler) toolSetReminder(args M) M {
 	if text == "" {
 		return timerError(ErrReminderTextEmpty)
 	}
-	now := m.now()
+	location, _ := reminderLocation("")
+	now := m.now().In(location)
 	due, err := reminderDueArg(args, now)
 	if err != nil {
 		return timerError(err)
 	}
-	due = due.UTC()
 	if !due.After(now) {
 		return timerError(errors.New("reminder time must be in the future"))
 	}
@@ -1430,11 +1433,32 @@ func (m *timerScheduler) updateReminder(id, text string, due time.Time) M {
 	return result
 }
 
-func (m *timerScheduler) toolListReminders() M {
+func (m *timerScheduler) toolListReminders(args M) M {
+	kind := firstString(args, "kind")
+	if kind != "" && kind != RemoteKindTask && kind != RemoteKindEvent {
+		return timerError(errors.New("kind must be task or event"))
+	}
+	location, _ := reminderLocation("")
+	now := m.now().In(location)
+	date := firstString(args, "date")
+	switch date {
+	case "today":
+		date = now.Format(time.DateOnly)
+	case "tomorrow":
+		date = now.AddDate(0, 0, 1).Format(time.DateOnly)
+	}
+	var day time.Time
+	if date != "" {
+		var err error
+		day, err = time.ParseInLocation(time.DateOnly, date, location)
+		if err != nil {
+			return timerError(errors.New("date must be today, tomorrow, or YYYY-MM-DD"))
+		}
+	}
+
 	m.reminderOpMu.Lock()
 	defer m.reminderOpMu.Unlock()
 
-	now := m.now()
 	local := m.snapshotReminderRecords()
 	offline := false
 	var backendErr error
@@ -1453,7 +1477,7 @@ func (m *timerScheduler) toolListReminders() M {
 			backendErr = err
 		}
 	}
-	return remindersResult(local, now, offline, backendErr)
+	return remindersResult(local, now, day, kind, offline, backendErr)
 }
 
 func (m *timerScheduler) toolCancelReminder(args M) M {
@@ -1645,8 +1669,9 @@ func reminderLocation(zone string) (*time.Location, string) {
 	return time.Local, time.Local.String()
 }
 
-func remindersResult(records []reminderRecord, now time.Time, offline bool, backendErr error) M {
+func remindersResult(records []reminderRecord, now, day time.Time, kind string, offline bool, backendErr error) M {
 	visible := make([]reminderRecord, 0, len(records))
+	end := day.AddDate(0, 0, 1)
 	pending := 0
 	for _, record := range records {
 		if record.Pending {
@@ -1654,6 +1679,19 @@ func remindersResult(records []reminderRecord, now time.Time, offline bool, back
 		}
 		if record.Deleted {
 			continue
+		}
+		itemKind := record.RemoteKind
+		if itemKind == "" {
+			itemKind = RemoteKindTask
+		}
+		if kind != "" && kind != itemKind {
+			continue
+		}
+		if !day.IsZero() {
+			due, ok := reminderDue(record.Reminder)
+			if !ok || due.Before(day) || !due.Before(end) {
+				continue
+			}
 		}
 		visible = append(visible, record)
 	}
@@ -1696,6 +1734,9 @@ func remindersResult(records []reminderRecord, now time.Time, offline bool, back
 	}
 
 	result := M{"ok": true, "count": len(items), "reminders": items}
+	if !day.IsZero() {
+		result["date"] = day.Format(time.DateOnly)
+	}
 	if pending > 0 {
 		result["pending_sync"] = pending
 	}
