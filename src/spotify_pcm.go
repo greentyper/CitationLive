@@ -75,9 +75,10 @@ func resetSpotifyBeforePlay(ctx context.Context) error {
 }
 
 func waitSpotifyReady(ctx context.Context, timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if readSpotifyNative().DeviceID != "" {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for ctx.Err() == nil {
+		if readSpotifyNativeContext(ctx).DeviceID != "" {
 			if _, err := spotifyNativeToken(ctx); err == nil {
 				return true
 			}
@@ -162,7 +163,7 @@ func spotifyArtistMatches(want string, names []string) bool {
 	}
 	for _, name := range names {
 		have := artistKey(name)
-		if have != "" && (have == want || strings.Contains(have, want) || strings.Contains(want, have)) {
+		if have == want {
 			return true
 		}
 	}
@@ -174,9 +175,9 @@ func spotifySearchTrackMatches(kind, requested, artist string, track spotifyNati
 	case "artist":
 		return spotifyArtistMatches(requested, track.ArtistNames)
 	case "album":
-		have := musicKey(track.AlbumName)
-		want := musicKey(requested)
-		return have != "" && want != "" && (have == want || strings.Contains(have, want) || closeMusicTitle(track.AlbumName, requested))
+		return musicKey(requested) != "" && musicKey(track.AlbumName) != "" &&
+			spotifyTrackTitleMatches(requested, track.AlbumName) &&
+			(artist == "" || spotifyArtistMatches(artist, track.ArtistNames))
 	case "track":
 		return spotifyTrackTitleMatches(requested, track.Name) &&
 			(artist == "" || spotifyArtistMatches(artist, track.ArtistNames))
@@ -184,12 +185,13 @@ func spotifySearchTrackMatches(kind, requested, artist string, track spotifyNati
 	return true
 }
 
-func waitSpotifyTrack(ctx context.Context, uri string, timeout time.Duration) (spotifyNativeStatus, bool) {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		status := readSpotifyNative()
-		if !status.Stopped && !status.Buffering && status.Track.Name != "" &&
-			(uri == "" || status.Track.URI == uri) {
+func waitSpotifyTrack(ctx context.Context, timeout time.Duration, matches func(spotifyNativeStatus) bool) (spotifyNativeStatus, bool) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for ctx.Err() == nil {
+		status := readSpotifyNativeContext(ctx)
+		if status.Available && !status.Stopped && !status.Buffering && !status.Paused &&
+			status.Track.URI != "" && status.Track.Name != "" && matches(status) {
 			return status, true
 		}
 		if waitSpotifyRegistration(ctx, 200*time.Millisecond) != nil {
@@ -201,7 +203,7 @@ func waitSpotifyTrack(ctx context.Context, uri string, timeout time.Duration) (s
 
 // Search results come from the paired player's own Spotify session. Play a
 // candidate silently, verify it against the request, and only then unmute.
-func playSpotifySearch(ctx context.Context, selection M, candidates []string) M {
+func playSpotifySearch(ctx context.Context, selection M, candidates []string) (result M) {
 	requested, _ := selection["requested_track"].(string)
 	artist, _ := selection["requested_artist"].(string)
 	kind, _ := selection["music_type"].(string)
@@ -220,7 +222,21 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 		released = true
 		return release()
 	}
-	defer func() { _ = unmute() }()
+	playAttempted := false
+	defer func() {
+		if playAttempted && result["ok"] != true {
+			cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 6*time.Second)
+			defer cancel()
+			if stopErr := spotifyNativeCommand(cleanup, "stop", M{}); stopErr != nil {
+				log.Printf("Spotify search cleanup: %v", stopErr)
+				if pauseErr := spotifyNativeCommand(cleanup, "pause", M{}); pauseErr != nil {
+					log.Printf("Spotify search cleanup: %v", pauseErr)
+					result["error"] = "Не удалось остановить пробное воспроизведение Spotify."
+				}
+			}
+		}
+		_ = unmute()
+	}()
 	limit := min(len(candidates), 5)
 	if kind == "album" {
 		limit = min(len(candidates), 2)
@@ -230,8 +246,15 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 		if err := ctx.Err(); err != nil {
 			return M{"ok": false, "error": err.Error()}
 		}
-		_ = spotifyNativeCommand(ctx, "play", M{"uri": candidates[i]})
-		status, ok := waitSpotifyTrack(ctx, candidates[i], 5*time.Second)
+		uri := candidates[i]
+		playAttempted = true
+		if err := spotifyNativeCommand(ctx, "play", M{"uri": uri}); err != nil {
+			log.Printf("Spotify search preview failed: %v", err)
+			continue
+		}
+		status, ok := waitSpotifyTrack(ctx, 5*time.Second, func(status spotifyNativeStatus) bool {
+			return status.Track.URI == uri
+		})
 		if ok {
 			sawTrack = true
 		}
@@ -239,11 +262,17 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 			log.Printf("spotify search rejected: uri=%s ok=%v name=%q artists=%v", candidates[i], ok, status.Track.Name, status.Track.ArtistNames)
 			continue
 		}
-		if kind == "album" && status.Track.AlbumURI != "" {
-			if err := spotifyNativeCommand(ctx, "play", M{"uri": status.Track.AlbumURI}); err != nil {
+		if kind == "album" {
+			albumURI := status.Track.AlbumURI
+			if !strings.HasPrefix(albumURI, "spotify:album:") {
+				continue
+			}
+			if err := spotifyNativeCommand(ctx, "play", M{"uri": albumURI}); err != nil {
 				return M{"ok": false, "error": err.Error()}
 			}
-			album, ok := waitSpotifyTrack(ctx, "", 12*time.Second)
+			album, ok := waitSpotifyTrack(ctx, 12*time.Second, func(status spotifyNativeStatus) bool {
+				return status.ContextURI == albumURI
+			})
 			if !ok {
 				return M{"ok": false, "error": "Spotify не подтвердил воспроизведение альбома."}
 			}
@@ -263,14 +292,33 @@ func playSpotifySearch(ctx context.Context, selection M, candidates []string) M 
 }
 
 func readSpotifyNative() spotifyNativeStatus {
-	var status spotifyNativeStatus
-	resp, err := spotifyNativeHTTP.Get(spotifyNativeAPI + "/status")
-	if err == nil {
-		defer resp.Body.Close()
-		status.Available = resp.StatusCode == http.StatusNoContent ||
-			(resp.StatusCode == http.StatusOK && json.NewDecoder(resp.Body).Decode(&status) == nil)
+	return readSpotifyNativeContext(context.Background())
+}
+
+func readSpotifyNativeContext(ctx context.Context) spotifyNativeStatus {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spotifyNativeAPI+"/status", nil)
+	if err != nil {
+		return spotifyNativeStatus{}
 	}
-	return status
+	resp, err := spotifyNativeHTTP.Do(req)
+	if err != nil {
+		return spotifyNativeStatus{}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent {
+		return spotifyNativeStatus{Available: true}
+	}
+	if resp.StatusCode != http.StatusOK {
+		return spotifyNativeStatus{}
+	}
+	const maxStatusBytes = 2 << 20
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxStatusBytes+1))
+	var status *spotifyNativeStatus
+	if err != nil || len(data) > maxStatusBytes || json.Unmarshal(data, &status) != nil || status == nil {
+		return spotifyNativeStatus{}
+	}
+	status.Available = true
+	return *status
 }
 
 func spotifyNativeToken(ctx context.Context) (string, error) {

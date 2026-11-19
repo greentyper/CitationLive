@@ -3,8 +3,29 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 )
+
+func TestNotesMergePreservesLocalNotesWhenRemoteListIsFull(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "notes.json")
+	store := &notesStore{path: path}
+	note, err := store.Create("Local note", "Do not erase")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := make([]GoogleTask, maxNotes)
+	for i := range tasks {
+		tasks[i] = GoogleTask{ID: strconv.Itoa(i), Title: "Remote note", Updated: "9999-01-01T00:00:00Z"}
+	}
+	if _, err := store.MergeRemote(tasks, "@default"); err != nil {
+		t.Fatal(err)
+	}
+	reloaded := &notesStore{path: path}
+	if _, err := reloaded.Get(note.ID, ""); err != nil {
+		t.Fatalf("remote cache displaced a local note: %v", err)
+	}
+}
 
 func TestNotesWriteFailureLeavesChecklistUnchanged(t *testing.T) {
 	dir := t.TempDir()

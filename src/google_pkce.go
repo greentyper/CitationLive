@@ -15,7 +15,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"net/url"
 	"os"
 	"strings"
@@ -34,6 +33,7 @@ type googlePKCESession struct {
 	Verifier    string
 	State       string
 	RedirectURI string
+	ClientID    string
 	Created     time.Time
 }
 
@@ -42,7 +42,10 @@ var googlePKCEState struct {
 	session *googlePKCESession
 }
 
-func googlePKCERedirectURI() string {
+func googlePKCERedirectURI(cfg GoogleOAuthConfig) string {
+	if cfg.DesktopClient {
+		return "http://127.0.0.1:28766"
+	}
 	if v := strings.TrimSpace(os.Getenv("CITATION_GOOGLE_REDIRECT_URI")); v != "" {
 		return v
 	}
@@ -73,12 +76,13 @@ func startGooglePKCEFrom(cfg GoogleOAuthConfig) (string, error) {
 	}
 	challengeBytes := sha256.Sum256([]byte(verifier))
 	challenge := base64.RawURLEncoding.EncodeToString(challengeBytes[:])
-	redirectURI := googlePKCERedirectURI()
+	redirectURI := googlePKCERedirectURI(normalized)
 	googlePKCEState.Lock()
 	googlePKCEState.session = &googlePKCESession{
 		Verifier:    verifier,
 		State:       state,
 		RedirectURI: redirectURI,
+		ClientID:    normalized.ClientID,
 		Created:     time.Now(),
 	}
 	googlePKCEState.Unlock()
@@ -92,18 +96,21 @@ func startGooglePKCEFrom(cfg GoogleOAuthConfig) (string, error) {
 	q.Set("code_challenge_method", "S256")
 	q.Set("access_type", "offline")
 	q.Set("prompt", "consent")
-	q.Set("include_granted_scopes", "true")
+	if !normalized.DesktopClient {
+		q.Set("include_granted_scopes", "true")
+	}
 	q.Set("state", state)
 	return googlePKCEAuthEndpoint + "?" + q.Encode(), nil
 }
 
 // startGooglePKCE uses the environment/file client configuration.
-func startGooglePKCE() (string, error) {
+func startGooglePKCE() (string, string, error) {
 	cfg, err := LoadGoogleOAuthConfig()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
-	return startGooglePKCEFrom(cfg)
+	authURL, err := startGooglePKCEFrom(cfg)
+	return authURL, googlePKCERedirectURI(cfg), err
 }
 
 // finishGooglePKCEFrom validates the state and exchanges the code.
@@ -113,17 +120,25 @@ func finishGooglePKCEFrom(ctx context.Context, cfg GoogleOAuthConfig, code, stat
 	}
 	googlePKCEState.Lock()
 	session := googlePKCEState.session
-	googlePKCEState.session = nil
-	googlePKCEState.Unlock()
 	if session == nil {
+		googlePKCEState.Unlock()
 		return nil, errors.New("google oauth: no pending authorization session")
 	}
 	if time.Since(session.Created) > googlePKCESessionTTL {
+		googlePKCEState.session = nil
+		googlePKCEState.Unlock()
 		return nil, errors.New("google oauth: authorization session expired")
 	}
-	if state != "" && state != session.State {
+	if state == "" || state != session.State {
+		googlePKCEState.Unlock()
 		return nil, errors.New("google oauth: state mismatch")
 	}
+	if cfg.ClientID != session.ClientID {
+		googlePKCEState.Unlock()
+		return nil, errors.New("google oauth: client changed during authorization")
+	}
+	googlePKCEState.session = nil
+	googlePKCEState.Unlock()
 	source, err := NewGoogleTokenSource(cfg)
 	if err != nil {
 		return nil, err
@@ -160,27 +175,12 @@ func installGoogleSyncBackend(dir string, source *GoogleTokenSource) {
 	googleSync.sync = cs
 	googleSync.Unlock()
 	setReminderBackend(cs)
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := cs.Sync(ctx); err != nil {
-			logGoogleSyncError(err)
-		}
-	}()
 }
 
 func googleSyncBackend() (*GoogleTokenSource, *CalendarSync) {
 	googleSync.RLock()
 	defer googleSync.RUnlock()
 	return googleSync.source, googleSync.sync
-}
-
-func logGoogleSyncError(err error) {
-	// Token material is never included in these errors.
-	if err != nil {
-		// Keep the log concise and free of response bodies.
-		fmt.Printf("google calendar/tasks sync: %v\n", err)
-	}
 }
 
 type googleOAuthStatus struct {

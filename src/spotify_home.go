@@ -89,8 +89,12 @@ func spotifyHomeAPI(w http.ResponseWriter, r *http.Request) {
 			body = bytes.NewBufferString("{}")
 		case "seek":
 			path = "/player/seek"
-			var req struct{ Position int }
-			if json.NewDecoder(http.MaxBytesReader(w, r.Body, 128)).Decode(&req) != nil || req.Position < 0 {
+			var req struct {
+				Position *int `json:"position"`
+			}
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 128))
+			if decoder.Decode(&req) != nil || req.Position == nil || *req.Position < 0 ||
+				decoder.Decode(&struct{}{}) != io.EOF {
 				http.Error(w, "invalid position", http.StatusBadRequest)
 				return
 			}
@@ -122,13 +126,24 @@ func syncSpotifyHomeSession() {
 	hadSession := false
 	for {
 		status := readSpotifyNative()
-		// Spotify clears Track while buffering the next song. Keep the Cast
-		// session alive until the player explicitly reports that it stopped.
-		if status.Available && !status.Buffering && (status.DeviceID == "" || status.Stopped || status.Track.URI != "") {
-			_ = updateSpotifyHomeSession(status.DeviceID != "" && !status.Stopped && !status.Paused, &hadSession)
+		if active, known := spotifyHomeSessionWanted(status); known {
+			_ = updateSpotifyHomeSession(active, &hadSession)
 		}
 		time.Sleep(2 * time.Second)
 	}
+}
+
+func spotifyHomeSessionWanted(status spotifyNativeStatus) (active, known bool) {
+	// Spotify clears Track while buffering the next song. Keep the Cast
+	// session alive until the player explicitly reports that it stopped.
+	if !status.Available || status.Buffering {
+		return false, false
+	}
+	if status.DeviceID == "" || status.Stopped {
+		return false, true
+	}
+	hasTrack := status.Track.URI != ""
+	return hasTrack, hasTrack
 }
 
 func updateSpotifyHomeSession(active bool, hadSession *bool) error {

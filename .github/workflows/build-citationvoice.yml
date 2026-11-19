@@ -46,7 +46,24 @@ jobs:
           GOARCH: arm
           GOARM: '7'
           CGO_ENABLED: '0'
-        run: go build -trimpath -buildvcs=false -ldflags='-s -w' -o "$RUNNER_TEMP/citationvoice" .
+          # Only CitationLive's public Desktop OAuth client belongs in the binary.
+          GOOGLE_DESKTOP_CLIENT_ID: ${{ vars.CITATION_GOOGLE_DESKTOP_CLIENT_ID }}
+          GOOGLE_DESKTOP_CLIENT_SECRET: ${{ vars.CITATION_GOOGLE_DESKTOP_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          ldflags='-s -w'
+          if [[ -n "$GOOGLE_DESKTOP_CLIENT_ID" || -n "$GOOGLE_DESKTOP_CLIENT_SECRET" ]]; then
+            if [[ ! "$GOOGLE_DESKTOP_CLIENT_ID" =~ ^[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$ ||
+                  ! "$GOOGLE_DESKTOP_CLIENT_SECRET" =~ ^[A-Za-z0-9_-]*$ ]]; then
+              echo "Invalid CitationLive Desktop OAuth client build configuration." >&2
+              exit 1
+            fi
+            ldflags="$ldflags -X main.releaseGoogleDesktopClientID=$GOOGLE_DESKTOP_CLIENT_ID"
+            if [[ -n "$GOOGLE_DESKTOP_CLIENT_SECRET" ]]; then
+              ldflags="$ldflags -X main.releaseGoogleDesktopClientSecret=$GOOGLE_DESKTOP_CLIENT_SECRET"
+            fi
+          fi
+          go build -trimpath -buildvcs=false -ldflags="$ldflags" -o "$RUNNER_TEMP/citationvoice" .
 
       - name: Publish a changed binary to main
         run: |

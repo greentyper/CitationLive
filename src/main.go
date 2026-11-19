@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"math"
@@ -2715,7 +2716,7 @@ func main() {
 	initTimerManager()
 	if source, err := NewGoogleTokenSourceFromEnv(); err == nil {
 		if st := source.Status(); st.Authorized {
-			setReminderBackend(NewCalendarSync(stateDirectory, source))
+			installGoogleSyncBackend(stateDirectory, source)
 			log.Printf("Google Calendar/Tasks reminder sync enabled for %s", st.Email)
 		} else {
 			log.Printf("Google Calendar/Tasks sync not authorized; using local reminders")
@@ -3139,18 +3140,17 @@ func main() {
 		json.NewEncoder(w).Encode(M{"ok": true, "path": path})
 	})
 	http.HandleFunc("/oauth/start", func(w http.ResponseWriter, r *http.Request) {
-		authURL, err := startGooglePKCE()
+		authURL, redirectURI, err := startGooglePKCE()
 		w.Header().Set("content-type", "application/json")
 		if err != nil {
 			json.NewEncoder(w).Encode(M{"ok": false, "error": clean(err)})
 			return
 		}
-		json.NewEncoder(w).Encode(M{"ok": true, "auth_url": authURL, "redirect_uri": googlePKCERedirectURI()})
+		json.NewEncoder(w).Encode(M{"ok": true, "auth_url": authURL, "redirect_uri": redirectURI})
 	})
-	http.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+	oauthCallback := func(w http.ResponseWriter, r *http.Request) {
 		if e := r.URL.Query().Get("error"); e != "" {
-			w.WriteHeader(400)
-			fmt.Fprintf(w, "Google authorization failed: %s\n", e)
+			http.Error(w, "Google authorization was declined or failed.", http.StatusBadRequest)
 			return
 		}
 		code := r.URL.Query().Get("code")
@@ -3161,10 +3161,18 @@ func main() {
 		w.Header().Set("content-type", "text/html; charset=utf-8")
 		if err != nil {
 			w.WriteHeader(400)
-			fmt.Fprintf(w, "<h1>Google authorization failed</h1><p>%s</p>", clean(err))
+			fmt.Fprintf(w, "<h1>Google authorization failed</h1><p>%s</p>", html.EscapeString(clean(err)))
 			return
 		}
-		fmt.Fprintf(w, "<h1>Google authorization complete</h1><p>Account: %s</p><p>You can close this page.</p>", tok.Email)
+		fmt.Fprintf(w, "<h1>Google authorization complete</h1><p>Account: %s</p><p>You can close this page.</p>", html.EscapeString(tok.Email))
+	}
+	http.HandleFunc("GET /oauth/callback", oauthCallback)
+	http.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		if !r.URL.Query().Has("code") && !r.URL.Query().Has("error") {
+			http.NotFound(w, r)
+			return
+		}
+		oauthCallback(w, r)
 	})
 	http.HandleFunc("/search/probe", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query().Get("q")

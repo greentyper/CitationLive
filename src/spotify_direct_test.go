@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"strings"
@@ -71,6 +72,12 @@ func TestSpotifySearchTrackMatches(t *testing.T) {
 	if !spotifySearchTrackMatches("album", "Example Album", "", track) {
 		t.Fatal("album deluxe edition was rejected")
 	}
+	if spotifySearchTrackMatches("album", "Example Album", "Other Artist", track) {
+		t.Fatal("album by the wrong artist was accepted")
+	}
+	if spotifySearchTrackMatches("album", "Example", "", track) {
+		t.Fatal("album title fragment was accepted")
+	}
 	if !spotifySearchTrackMatches("artist", "Example Artist", "", track) {
 		t.Fatal("artist match was rejected")
 	}
@@ -86,6 +93,7 @@ func TestSpotifyArtistMatchesTransliteration(t *testing.T) {
 		{"Мумий", []string{"Mumiy"}, true},
 		{"Кино", []string{"Kino"}, true},
 		{"Кино", []string{"Другой"}, false},
+		{"Donna", []string{"Madonna"}, false},
 		{"Зима", []string{"Zima"}, true},
 	}
 	for _, tc := range cases {
@@ -96,6 +104,110 @@ func TestSpotifyArtistMatchesTransliteration(t *testing.T) {
 	track := spotifyNativeTrack{Name: "Тестовый трек", ArtistNames: []string{"Primer"}}
 	if !spotifySearchTrackMatches("track", "Тестовый трек", "Пример", track) {
 		t.Fatal("Russian title and transliterated artist were rejected")
+	}
+}
+
+func mockSpotifySearch(t *testing.T, track spotifyNativeTrack, firstAlbumPollIsStale bool) (*[]string, *int) {
+	t.Helper()
+	oldTransport, oldDucking := http.DefaultTransport, ducking
+	t.Cleanup(func() {
+		http.DefaultTransport, ducking = oldTransport, oldDucking
+	})
+	var actions []string
+	var albumPolls int
+	var requestedURI string
+	ducking = newDuckingManager(func(_ int, level float32) error {
+		if level == 0 {
+			actions = append(actions, "mute")
+		} else {
+			actions = append(actions, "unmute")
+		}
+		return nil
+	}, nil)
+	http.DefaultTransport = spotifyTestTransport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "127.0.0.1:18767" {
+			t.Fatalf("unexpected host: %s", r.URL.Host)
+		}
+		body := "{}"
+		switch r.URL.Path {
+		case "/status":
+			status := spotifyNativeStatus{DeviceID: "test-speaker"}
+			switch requestedURI {
+			case "":
+			case track.URI:
+				status.Track = track
+				status.ContextURI = track.URI
+			case track.AlbumURI:
+				albumPolls++
+				status.Track = track
+				status.ContextURI = track.URI
+				if !firstAlbumPollIsStale || albumPolls > 1 {
+					status.Track.URI = "spotify:track:album-first"
+					status.ContextURI = requestedURI
+				}
+			}
+			encoded, err := json.Marshal(status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body = string(encoded)
+		case "/token":
+			body = `{"token":"test"}`
+		case "/player/play":
+			var req struct{ URI string }
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatal(err)
+			}
+			requestedURI = req.URI
+			actions = append(actions, "play:"+requestedURI)
+		case "/player/stop":
+			actions = append(actions, "stop")
+			requestedURI = ""
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})
+	return &actions, &albumPolls
+}
+
+func TestSpotifySearchStopsRejectedTrackBeforeRestoringVolume(t *testing.T) {
+	track := spotifyNativeTrack{URI: "spotify:track:wrong", Name: "Unrelated"}
+	actions, _ := mockSpotifySearch(t, track, false)
+	selection := M{"music_type": "track", "requested_track": "Another Name"}
+	if got := playSpotifySearch(context.Background(), selection, []string{track.URI}); got["ok"] != false {
+		t.Fatalf("unexpected success: %v", got)
+	}
+	if got := strings.Join(*actions, ","); got != "mute,play:spotify:track:wrong,stop,unmute" {
+		t.Fatalf("rejected track must stop before unmute, got %s", got)
+	}
+}
+
+func TestSpotifySearchWaitsForRequestedAlbumContext(t *testing.T) {
+	track := spotifyNativeTrack{
+		URI: "spotify:track:preview", Name: "Preview", AlbumURI: "spotify:album:requested", AlbumName: "Requested",
+	}
+	actions, albumPolls := mockSpotifySearch(t, track, true)
+	selection := M{"music_type": "album", "requested_track": "Requested"}
+	got := playSpotifySearch(context.Background(), selection, []string{track.URI})
+	if got["ok"] != true || got["selected_uri"] != "spotify:track:album-first" || *albumPolls != 2 {
+		t.Fatalf("expected confirmed album playback, got %v after %d album polls", got, *albumPolls)
+	}
+	if got := strings.Join(*actions, ","); got != "mute,play:spotify:track:preview,play:spotify:album:requested,unmute" {
+		t.Fatalf("unexpected album calls: %s", got)
+	}
+}
+
+func TestSpotifyMalformedNativeStatusDiscardsPartialDevice(t *testing.T) {
+	old := spotifyNativeHTTP
+	t.Cleanup(func() { spotifyNativeHTTP = old })
+	for _, body := range []string{`{"device_id":"partial","track":5}`, "null", `{"device_id":"partial"} []`} {
+		spotifyNativeHTTP = &http.Client{Transport: spotifyTestTransport(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})}
+		if status := readSpotifyNative(); status.DeviceID != "" || status.Available {
+			t.Errorf("invalid status %q yielded an available device: %+v", body, status)
+		}
 	}
 }
 

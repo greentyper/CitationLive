@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -100,13 +101,14 @@ type GoogleOAuthEndpoints struct {
 // ClientSecret is optional: Google's "TVs and Limited Input devices" client
 // type does not use one, but a confidential client may.
 type GoogleOAuthConfig struct {
-	ClientID     string
-	ClientSecret string
-	Scopes       []string
-	StateDir     string // defaults to stateDirectory
-	Endpoints    GoogleOAuthEndpoints
-	HTTPClient   *http.Client
-	Now          func() time.Time
+	ClientID      string
+	ClientSecret  string
+	DesktopClient bool
+	Scopes        []string
+	StateDir      string // defaults to stateDirectory
+	Endpoints     GoogleOAuthEndpoints
+	HTTPClient    *http.Client
+	Now           func() time.Time
 }
 
 // DeviceAuthSession is the result of StartDeviceAuth. DeviceCode is secret
@@ -181,6 +183,11 @@ type GoogleAuthStatus struct {
 // GoogleTokenSource implements the shared TokenProvider interface declared in
 // calendar_models.go.
 var _ TokenProvider = (*GoogleTokenSource)(nil)
+
+// Release builds may supply CitationLive's public Desktop OAuth client via -X.
+// A Desktop client credential is distributable; a Web client secret is not.
+var releaseGoogleDesktopClientID string
+var releaseGoogleDesktopClientSecret string
 
 // GoogleTokenSource owns the device flow, the on-disk token, and refresh.
 // It is safe for concurrent use.
@@ -320,11 +327,20 @@ func LoadGoogleOAuthConfigFrom(dir string) (GoogleOAuthConfig, error) {
 		}
 	}
 
-	if v := firstNonEmptyEnv(envGoogleClientID, envGoogleClientIDAlt); v != "" {
-		cfg.ClientID = v
+	if id := firstNonEmptyEnv(envGoogleClientID, envGoogleClientIDAlt); id != "" {
+		if id != cfg.ClientID {
+			cfg.ClientSecret = ""
+		}
+		cfg.ClientID = id
 	}
-	if v := firstNonEmptyEnv(envGoogleClientSecret, envGoogleSecretAlt); v != "" {
-		cfg.ClientSecret = v
+	if cfg.ClientID != "" {
+		if secret := firstNonEmptyEnv(envGoogleClientSecret, envGoogleSecretAlt); secret != "" {
+			cfg.ClientSecret = secret
+		}
+	} else if id := strings.TrimSpace(releaseGoogleDesktopClientID); id != "" {
+		cfg.ClientID = id
+		cfg.ClientSecret = strings.TrimSpace(releaseGoogleDesktopClientSecret)
+		cfg.DesktopClient = true
 	}
 	if cfg.ClientID == "" {
 		return cfg, errors.New("google oauth: client id is not configured (set " + envGoogleClientID + " or write " + path + ")")
@@ -516,6 +532,14 @@ func (g *GoogleTokenSource) ExchangeAuthCode(ctx context.Context, code, verifier
 	if err != nil {
 		return nil, err
 	}
+	if tok.RefreshToken == "" {
+		return nil, errors.New("google oauth: Google did not grant background access")
+	}
+	for _, required := range GoogleRequiredScopes() {
+		if !slices.Contains(tok.Scopes, required) {
+			return nil, errors.New("google oauth: Calendar and Tasks permissions are both required")
+		}
+	}
 	if err := g.storeToken(tok); err != nil {
 		return nil, err
 	}
@@ -606,6 +630,13 @@ func (g *GoogleTokenSource) refreshToken(ctx context.Context, refreshToken strin
 	}
 	if tok.RefreshToken == "" {
 		tok.RefreshToken = refreshToken
+	}
+	if tok.Email == "" {
+		g.mu.Lock()
+		if g.token != nil && g.token.RefreshToken == refreshToken {
+			tok.Email = g.token.Email
+		}
+		g.mu.Unlock()
 	}
 	if err := g.storeToken(tok); err != nil {
 		return nil, err
@@ -786,6 +817,9 @@ func (g *GoogleTokenSource) loadTokenLocked() (*GoogleToken, error) {
 	}
 	if stored.Version > googleTokenFileVersion {
 		return nil, errors.New("google oauth: token file version is not supported")
+	}
+	if stored.ClientID != "" && stored.ClientID != g.cfg.ClientID {
+		return nil, nil
 	}
 	if stored.AccessToken == "" && stored.RefreshToken == "" {
 		return nil, errors.New("google oauth: token file has no credentials")

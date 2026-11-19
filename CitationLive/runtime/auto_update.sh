@@ -51,11 +51,15 @@ restore_previous() {
     read -r name < "$state/pending"
     case "$name" in citationvoice|citationvoice.real) ;; *) return 1 ;; esac
     live=$bin/$name
-    failed_pid=$(daemon_pid "$live" || true)
-    ln -f "$state/previous" "$state/restore" &&
-        mv -f "$state/restore" "$live" || return 1
-    if test -n "$failed_pid"; then
-        kill -TERM "$failed_pid" 2>/dev/null || true
+    # The journal can survive a crash between recording pending and promoting
+    # the candidate. In that case the original is still the backup's hard link.
+    if ! test "$state/previous" -ef "$live"; then
+        failed_pid=$(daemon_pid "$live" || true)
+        ln -f "$state/previous" "$state/restore" &&
+            mv -f "$state/restore" "$live" || return 1
+        if test -n "$failed_pid"; then
+            kill -TERM "$failed_pid" 2>/dev/null || true
+        fi
     fi
     clear_rollback || return 1
     printf '%s\n' 'Restored previous CitationLive executable.'
@@ -87,11 +91,16 @@ assistant_idle() {
 speaker_idle() {
     assistant_idle || return 1
     if systemctl is-active --quiet citation-spotify-connect.service; then
-        spotify=$(curl -fsS --max-time 3 http://127.0.0.1:18767/status) || return 1
+        spotify=$(curl -fsS --max-time 3 -w '\n%{http_code}' http://127.0.0.1:18767/status) || return 1
+        case "$(printf '%s\n' "$spotify" | tail -n 1)" in
+            204) return 0 ;;
+            200) ;;
+            *) return 1 ;;
+        esac
         if printf '%s' "$spotify" | grep -Eq '"buffering"[[:space:]]*:[[:space:]]*true'; then
             return 1
         fi
-        test -z "$spotify" || printf '%s' "$spotify" | grep -Eq '"(paused|stopped)"[[:space:]]*:[[:space:]]*true'
+        printf '%s' "$spotify" | grep -Eq '"(paused|stopped)"[[:space:]]*:[[:space:]]*true'
     fi
 }
 
@@ -101,7 +110,8 @@ wait_ready() {
         new_pid=$(daemon_pid "$1" || true)
         if test -n "$new_pid" && test "$new_pid" != "$2"; then
             status=$(curl -fsS --max-time 2 http://127.0.0.1:8766/status) || status=
-            if printf '%s' "$status" | grep -Eq '"native"[[:space:]]*:[[:space:]]*true'; then
+            if printf '%s' "$status" | grep -Eq '"native"[[:space:]]*:[[:space:]]*true' &&
+               printf '%s' "$status" | grep -Eq '"capture_health"[[:space:]]*:[[:space:]]*\{[^}]*"running"[[:space:]]*:[[:space:]]*true'; then
                 return 0
             fi
         fi
@@ -134,7 +144,10 @@ check() {
     meta=$(github_get --max-filesize 65536 "$repo/contents/CitationLive/dist/citationvoice?ref=main")
     sha=$(printf '%s\n' "$meta" | sed -n 's/^[[:space:]]*"sha":[[:space:]]*"\([0-9a-f]*\)".*/\1/p')
     size=$(printf '%s\n' "$meta" | sed -n 's/^[[:space:]]*"size":[[:space:]]*\([0-9]*\).*/\1/p')
-    test "${#sha}" -eq 40 && test -n "$size" && test "$size" -gt 0 && test "$size" -le 33554432
+    if ! { test "${#sha}" -eq 40 && test -n "$size" && test "$size" -gt 0 && test "$size" -le 33554432; }; then
+        echo 'Invalid CitationLive metadata from GitHub.' >&2
+        return 1
+    fi
     test "$sha" != "$(blob_sha "$target")" || return 0
     test "$sha" != "$(cat "$state/rejected" 2>/dev/null || true)" || return 0
 

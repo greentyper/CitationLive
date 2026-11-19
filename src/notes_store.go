@@ -365,10 +365,15 @@ func (m *notesStore) MergeRemote(tasks []GoogleTask, list string) ([]Note, error
 
 	merged := make([]Note, 0, len(m.notes)+len(taskByID))
 	matched := make(map[string]bool, len(taskByID))
+	isProtected := func(note Note) bool {
+		return note.RemoteID == "" || (note.RemoteList != "" && note.RemoteList != list)
+	}
+	protected := 0
 	for i := range m.notes {
 		note := m.notes[i]
-		if note.RemoteID == "" || (note.RemoteList != "" && note.RemoteList != list) {
+		if isProtected(note) {
 			merged = append(merged, note)
+			protected++
 			continue
 		}
 		task, ok := taskByID[note.RemoteID]
@@ -386,11 +391,15 @@ func (m *notesStore) MergeRemote(tasks []GoogleTask, list string) ([]Note, error
 		matched[task.ID] = true
 		merged = append(merged, noteFromRemote(task, Note{}, list, now))
 	}
-	if len(merged) > maxNotes {
+	if limit := max(maxNotes, protected); len(merged) > limit {
 		sort.SliceStable(merged, func(i, j int) bool {
+			leftProtected, rightProtected := isProtected(merged[i]), isProtected(merged[j])
+			if leftProtected != rightProtected {
+				return leftProtected
+			}
 			return merged[i].Updated > merged[j].Updated
 		})
-		merged = merged[:maxNotes]
+		merged = merged[:limit]
 	}
 	err := m.saveLocked(merged)
 	out := make([]Note, 0, len(merged))

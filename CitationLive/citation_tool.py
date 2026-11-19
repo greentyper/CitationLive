@@ -400,6 +400,7 @@ def check_prerequisites():
 
     for relative in ('dist/iot_audio_capture48k', 'dist/libassistant.hotword-observe-v3.so',
                      'runtime/supervise.sh', 'runtime/alsa_looper.sh', 'runtime/auto_update.sh',
+                     'runtime/backup_before_install.sh',
                      'runtime/ensure_native_capture.sh', 'runtime/ensure_early_hotword.sh',
                      'config.example.json'):
         if not (ROOT / relative).is_file():
@@ -818,20 +819,28 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
     def check_online_again():
         try:
             subprocess.run([str(ADB), 'connect', f'{target_host}:5555'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
-            p = subprocess.run([str(ADB), '-s', adb_serial, 'shell', 'curl -s http://127.0.0.1:8766/status; grep -q mixer /proc/net/unix && echo MIXER_OK || true; curl -s -o /dev/null -w RECEIVER=%{http_code} http://127.0.0.1:18768/receiver'],
-                               capture_output=True, text=True, timeout=3, errors='replace')
-            if 'capture_health' in p.stdout and '"running":true' in p.stdout and 'MIXER_OK' in p.stdout and 'RECEIVER=200' in p.stdout:
-                return True
-        except Exception:
-            pass
-        return None
+            p = subprocess.run(
+                [str(ADB), '-s', adb_serial, 'shell',
+                 "curl -fsS --max-time 2 http://127.0.0.1:8766/status && "
+                 "grep -Eq '[[:space:]]@/tmp/mixer-service$' /proc/net/unix && echo MIXER_OK"],
+                capture_output=True, text=True, timeout=5, errors='replace',
+            )
+            raw, marker = p.stdout.strip().rsplit('\n', 1)
+            if p.returncode or marker != 'MIXER_OK':
+                return False
+            status = json.loads(raw)
+        except (subprocess.SubprocessError, OSError, ValueError):
+            return False
+        if not isinstance(status, dict) or status.get('native') is not True:
+            return False
+        capture = status.get('capture_health')
+        return isinstance(capture, dict) and capture.get('running') is True
 
     log("Ожидание перезапуска службы ассистента и аудиосистемы (порт 8766)...", 'INFO')
     ready = spinner_wait("Проверка запуска citationvoice, микрофона и микшера...", check_online_again, timeout=90, interval=2.0)
 
     if ready:
         log("Служба citationvoice активна! Микрофонный поток и аудиосистема в норме.", 'OK')
-        log("Cast-приёмник CitationLive доступен: Google Home получает название трека, исполнителя и обложку.", 'OK')
         configure_dns(target_host)
         log("Проверка готовности облачного шлюза Gemini Live...", 'INFO')
         t_res = subprocess.run([str(ADB), '-s', adb_serial, 'shell',
@@ -848,7 +857,8 @@ def step4_install_gemini_assistant(adb_serial, api_key=None, model="models/gemin
                    'Files are installed, but Gemini Live readiness was not confirmed. Check the key and DNS/proxy.'), 'ERR')
             return False
     else:
-        log("Служба не подтвердила готовность за 90 секунд. Проверьте service.log и Cast-приёмник (порт 18768).", 'ERR')
+        log(ui("Служба не подтвердила готовность. Проверьте service.log.",
+               "The assistant did not become ready. Check service.log."), 'ERR')
         return False
     configure_auto_updates(adb_serial, offer=True)
     return True
@@ -863,14 +873,17 @@ def setup_spotify(adb_serial):
     open_page('http://127.0.0.1:28766/spotify/setup')
 
     def check_spotify_connected():
-        p = subprocess.run([str(ADB), '-s', adb_serial, 'shell',
-                            'curl -fsS --max-time 3 http://127.0.0.1:8766/spotify/status'],
-                           capture_output=True, text=True, errors='replace', timeout=5)
         try:
+            p = subprocess.run([str(ADB), '-s', adb_serial, 'shell',
+                                'curl -fsS --max-time 3 http://127.0.0.1:8766/spotify/status'],
+                               capture_output=True, text=True, errors='replace', timeout=5)
+            if p.returncode:
+                return False
             status = json.loads(p.stdout)
-        except ValueError:
-            return None
-        return status.get('connected') is True and status.get('receiver_ready') is True
+        except (subprocess.TimeoutExpired, ValueError):
+            return False
+        return (isinstance(status, dict) and status.get('connected') is True
+                and status.get('receiver_ready') is True)
 
     ready = spinner_wait("Ожидание подтверждения привязки Spotify...", check_spotify_connected, timeout=120, interval=2.0)
     if ready:
@@ -931,23 +944,25 @@ def guide_google_client(callback):
 
 
 def setup_google_calendar(adb_serial):
-    """Guide the owner through creating or loading a Google OAuth web client."""
+    """Connect Google Calendar and Tasks using a configured or personal OAuth client."""
     from scripts.connect_google import CALLBACK, load_client
 
     print(ui('\nGoogle Календарь и Задачи\n'
-             'Для входа нужен JSON клиента OAuth из Google Cloud.\n'
-             ' [1] Провести меня по настройке Google Cloud\n'
-             ' [2] JSON уже скачан\n [0] Пропустить',
+             ' [1] Войти через Google\n'
+             ' [2] Подключить свой OAuth-клиент из JSON\n'
+             ' [3] Настроить свой клиент в Google Cloud\n [0] Пропустить',
              '\nGoogle Calendar and Tasks\n'
-             'Sign-in requires an OAuth client JSON from Google Cloud.\n'
-             ' [1] Guide me through Google Cloud setup\n'
-             ' [2] I already downloaded the JSON\n [0] Skip'))
+             ' [1] Sign in with Google\n'
+             ' [2] Use my own OAuth client JSON\n'
+             ' [3] Set up my own client in Google Cloud\n [0] Skip'))
     while True:
-        choice = input(ui('Выберите 1, 2 или 0: ', 'Choose 1, 2 or 0: ')).strip()
-        if choice in ('1', '2', '0', ''):
+        choice = input(ui('Выберите 1, 2, 3 или 0: ', 'Choose 1, 2, 3 or 0: ')).strip()
+        if choice in ('1', '2', '3', '0', ''):
             break
-    if choice in ('0', '') or (choice == '1' and not guide_google_client(CALLBACK)):
+    if choice in ('0', '') or (choice == '3' and not guide_google_client(CALLBACK)):
         return
+    if choice == '1':
+        return open_google_calendar_consent(adb_serial)
 
     print(ui('Перетащите скачанный файл из Загрузок сюда или вставьте его полный путь.\n'
              'Имя файла может начинаться с client_secret_. Храните его вне папки CitationLive.',
@@ -979,20 +994,40 @@ def setup_google_calendar(adb_serial):
             continue
         break
 
+    return open_google_calendar_consent(adb_serial, p.resolve())
+
+
+def open_google_calendar_consent(adb_serial, client_path=None):
+    from scripts.connect_google import local_request
+
     log(f"Проброс порта ADB tcp:28766 -> tcp:8766 на {adb_serial}...", 'INFO')
     subprocess.run([str(ADB), '-s', adb_serial, 'forward', 'tcp:28766', 'tcp:8766'], capture_output=True, check=True, timeout=15)
 
-    cmd = [PYTHON_EXE, '-B', str(SCRIPTS_DIR / 'connect_google.py'), '--client-json', str(p.resolve())]
+    cmd = [PYTHON_EXE, '-B', str(SCRIPTS_DIR / 'connect_google.py')]
+    if client_path is not None:
+        cmd += ['--client-json', str(client_path)]
     log("Запуск скрипта авторизации Google OAuth...", 'INFO')
     res = subprocess.run(cmd)
     if res.returncode == 0:
-        print(ui('Выберите в браузере аккаунт, который добавили в Test users, и подтвердите доступ.\n'
+        print(ui('Выберите в браузере аккаунт Google и подтвердите доступ к Календарю и Задачам.\n'
                  'Дождитесь страницы об успешном подключении и вернитесь сюда.',
-                 'In the browser, select the account you added under Test users and approve access.\n'
+                 'In the browser, select your Google account and approve Calendar and Tasks access.\n'
                  'Wait for the success page, then return here.'))
         input(ui('Enter — продолжить: ', 'Enter to continue: '))
+        try:
+            if local_request('/oauth/status').get('authorized') is True:
+                log(ui('На колонке есть сохранённое разрешение для Google Календаря и Задач.',
+                       'Google Calendar and Tasks authorization is saved on the speaker.'), 'OK')
+                return True
+        except (OSError, ValueError):
+            pass
+        log(ui('Google ещё не подтвердил подключение.', 'Google has not confirmed the connection.'), 'WARN')
+    elif res.returncode == 2:
+        log(ui('В этой сборке не настроен вход через Google. Можно использовать свой OAuth-клиент в пункте [2].',
+               'This build has no Google sign-in client. You can use your own OAuth client in option [2].'), 'WARN')
     else:
         log("Ошибка при подключении Google OAuth.", 'ERR')
+    return False
 
 
 NEWS_AUTH_COOKIES = ('SID', 'SSID', 'HSID', 'SAPISID', 'APISID',

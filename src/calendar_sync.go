@@ -211,7 +211,8 @@ func (c *GoogleCalendarClient) httpClient() *http.Client {
 func (c *GoogleCalendarClient) ListEvents(ctx context.Context, timeMin, timeMax string) ([]CalendarEvent, error) {
 	events := make([]CalendarEvent, 0)
 	pageToken := ""
-	for page := 0; page < 20; page++ {
+	seenTokens := make(map[string]bool)
+	for {
 		query := url.Values{}
 		query.Set("singleEvents", "true")
 		query.Set("orderBy", "startTime")
@@ -241,11 +242,14 @@ func (c *GoogleCalendarClient) ListEvents(ctx context.Context, timeMin, timeMax 
 			events = append(events, eventFromGoogle(item))
 		}
 		if page.NextPageToken == "" {
-			break
+			return events, nil
 		}
+		if seenTokens[page.NextPageToken] {
+			return nil, errors.New("google calendar: repeated page token")
+		}
+		seenTokens[page.NextPageToken] = true
 		pageToken = page.NextPageToken
 	}
-	return events, nil
 }
 
 func (c *GoogleCalendarClient) CreateEvent(ctx context.Context, event CalendarEvent) (CalendarEvent, error) {
@@ -466,7 +470,8 @@ func (c *GoogleTasksClient) ListTasks(ctx context.Context, tasklist string) ([]G
 	list := taskListID(tasklist)
 	tasks := make([]GoogleTask, 0)
 	pageToken := ""
-	for page := 0; page < 20; page++ {
+	seenTokens := make(map[string]bool)
+	for {
 		query := url.Values{}
 		query.Set("showCompleted", "true")
 		query.Set("showHidden", "true")
@@ -490,11 +495,14 @@ func (c *GoogleTasksClient) ListTasks(ctx context.Context, tasklist string) ([]G
 			tasks = append(tasks, taskFromGoogle(item))
 		}
 		if page.NextPageToken == "" {
-			break
+			return tasks, nil
 		}
+		if seenTokens[page.NextPageToken] {
+			return nil, errors.New("google tasks: repeated page token")
+		}
+		seenTokens[page.NextPageToken] = true
 		pageToken = page.NextPageToken
 	}
-	return tasks, nil
 }
 
 func (c *GoogleTasksClient) CreateTask(ctx context.Context, tasklist string, task GoogleTask) (GoogleTask, error) {
@@ -583,8 +591,8 @@ func taskToGoogle(task GoogleTask) (googleTask, error) {
 	}, nil
 }
 
-// taskDueWire formats a due timestamp the way the Tasks API expects: UTC with
-// millisecond precision. Empty due dates are omitted.
+// taskDueWire sends the calendar date of a reminder as UTC midnight because
+// Google Tasks discards the time of day.
 func taskDueWire(due string) (string, error) {
 	if due == "" {
 		return "", nil
@@ -593,7 +601,7 @@ func taskDueWire(due string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("google task due must be RFC3339: %w", err)
 	}
-	return parsed.UTC().Format("2006-01-02T15:04:05.000Z"), nil
+	return parsed.Format("2006-01-02") + "T00:00:00.000Z", nil
 }
 
 func taskFromGoogle(task googleTask) GoogleTask {
@@ -1118,7 +1126,10 @@ func (s *CalendarSync) applyOpLocked(ctx context.Context, op PendingOp, reminder
 		}
 		reminder.ETag = updated.ETag
 		reminder.Updated = updated.Updated
-		reminder.Due = updated.Due
+		// Tasks returns only a date. Keep the time of a reminder created here.
+		if isImportedGoogleTask(reminder) {
+			reminder.Due = updated.Due
+		}
 		reminder.Source = ReminderSourceTask
 		s.state.Reminders[index] = reminder
 		s.cacheTaskLocked(updated)
@@ -1258,6 +1269,10 @@ func (s *CalendarSync) mergeLocked(events []CalendarEvent, tasks []GoogleTask) {
 	windowStart, _ := time.Parse(time.RFC3339, s.state.WindowStart)
 	windowEnd, _ := time.Parse(time.RFC3339, s.state.WindowEnd)
 	pendingDeletes := s.pendingDeletesLocked()
+	previousTaskDates := make(map[string]string, len(s.state.Tasks))
+	for _, task := range s.state.Tasks {
+		previousTaskDates[task.ID] = task.Due
+	}
 
 	merged := make([]Reminder, 0, len(s.state.Reminders)+len(remote))
 	seen := make(map[string]bool, len(remote))
@@ -1302,6 +1317,15 @@ func (s *CalendarSync) mergeLocked(events []CalendarEvent, tasks []GoogleTask) {
 		remoteReminder.ID = local.ID
 		remoteReminder.RemoteID = local.RemoteID
 		remoteReminder.RemoteKind = local.RemoteKind
+		if local.RemoteKind == RemoteKindTask && !isImportedGoogleTask(local) && remoteReminder.Due != "" {
+			previous, known := previousTaskDates[local.RemoteID]
+			if !known {
+				previous, _ = taskDueWire(local.Due)
+			}
+			if normalizeRFC3339(previous) == normalizeRFC3339(remoteReminder.Due) {
+				remoteReminder.Due = local.Due
+			}
+		}
 		if local.Source == ReminderSourceLocal {
 			remoteReminder.Source = ReminderSourceLocal
 		}
@@ -1370,6 +1394,10 @@ func reminderFromTask(task GoogleTask) Reminder {
 		RemoteID:   task.ID,
 		RemoteKind: RemoteKindTask,
 	}
+}
+
+func isImportedGoogleTask(reminder Reminder) bool {
+	return reminder.RemoteKind == RemoteKindTask && strings.HasPrefix(reminder.ID, "task:")
 }
 
 func remoteKey(reminder Reminder) string {

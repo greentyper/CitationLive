@@ -1,4 +1,4 @@
-"""Connect the user's own Google OAuth web client through a local ADB forward."""
+"""Connect a Google account through a local ADB forward."""
 from pathlib import Path
 import argparse
 import json
@@ -10,6 +10,10 @@ import webbrowser
 
 BASE = 'http://127.0.0.1:28766'
 CALLBACK = BASE + '/oauth/callback'
+
+
+class ClientNotConfigured(ValueError):
+    pass
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -35,7 +39,7 @@ def parse_client(document):
 def load_client(source):
     source = source.resolve()
     public = Path(__file__).resolve().parents[1]
-    if (public.parent / 'BUILD_INFO.json').is_file():
+    if (public.parent / 'BUILD_INFO.json').is_file() or (public.parent / '.git').exists():
         public = public.parent
     if source == public or public in source.parents:
         raise ValueError('Private client file must be outside repository')
@@ -52,13 +56,14 @@ def validate_consent_url(value):
             or parsed.path != '/o/oauth2/v2/auth'):
         raise ValueError('Unexpected consent URL')
     query = urllib.parse.parse_qs(parsed.query)
-    if query.get('redirect_uri') != [CALLBACK]:
+    redirect_uri = query.get('redirect_uri', [])
+    if len(redirect_uri) != 1 or redirect_uri[0] not in (CALLBACK, BASE):
         raise ValueError('Unexpected OAuth callback')
     return value
 
 
 def local_request(path, data=None):
-    if path not in ('/oauth/client', '/oauth/start'):
+    if path not in ('/oauth/client', '/oauth/start', '/oauth/status'):
         raise ValueError('Unknown local endpoint')
     body = json.dumps(data).encode('utf-8') if data is not None else None
     request = urllib.request.Request(BASE + path, data=body, headers={'Content-Type': 'application/json'})
@@ -69,22 +74,29 @@ def local_request(path, data=None):
     if len(payload) > 65536:
         raise ValueError('Oversized local response')
     result = json.loads(payload)
-    if not isinstance(result, dict) or result.get('ok') is not True:
+    if not isinstance(result, dict) or (path != '/oauth/status' and result.get('ok') is not True):
         raise ValueError('Local service refused the request')
     return result
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--client-json', required=True, type=Path,
-                        help='Private OAuth WEB client JSON outside repository')
-    args = parser.parse_args()
-    try:
-        client = load_client(args.client_json)
+def start_consent(client_path=None):
+    if client_path is not None:
+        client = load_client(client_path)
         print('Sending your OAuth client only to the local ADB-forwarded service.')
         local_request('/oauth/client', client)
-        result = local_request('/oauth/start')
-        consent = validate_consent_url(result.get('auth_url'))
+    elif local_request('/oauth/status').get('configured') is not True:
+        raise ClientNotConfigured('No Google OAuth client configured')
+    result = local_request('/oauth/start')
+    return validate_consent_url(result.get('auth_url'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--client-json', type=Path,
+                        help='Use a private OAuth WEB client JSON instead of the configured client')
+    args = parser.parse_args()
+    try:
+        consent = start_consent(args.client_json)
         try:
             opened = webbrowser.open(consent)
         except Exception:
@@ -92,9 +104,11 @@ def main():
         if not opened:
             print('Browser did not open. Open this one-time consent link on this computer:')
             print(consent)
+    except ClientNotConfigured:
+        parser.exit(2, 'This CitationLive build has no configured Google sign-in client. Use a configured build or your own client.\n')
     except (OSError, ValueError, urllib.error.URLError):
         # Never echo the JSON, raw server error, client ID, secret or consent state.
-        parser.exit(1, 'Google setup failed. Check local forward, WEB client file and registered callback. No credential details displayed.\n')
+        parser.exit(1, 'Google setup failed. Check the speaker connection and OAuth client configuration.\n')
     print('Finish consent in the browser. Connection is confirmed only by the callback success page, not by opening the browser.')
 
 

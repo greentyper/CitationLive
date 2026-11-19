@@ -27,6 +27,9 @@ type persistedTimerState struct {
 }
 
 func (m *timerScheduler) load() error {
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+
 	data, err := os.ReadFile(m.path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
@@ -96,6 +99,11 @@ func (m *timerScheduler) load() error {
 }
 
 func (m *timerScheduler) save() error {
+	// Take the snapshot after serializing writers so that a slower, older
+	// snapshot cannot overwrite state saved by a concurrent operation.
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+
 	m.mu.Lock()
 	state := persistedTimerState{
 		Version:       1,

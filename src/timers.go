@@ -81,8 +81,10 @@ type timerEvent struct {
 }
 
 type timerScheduler struct {
-	mu           sync.Mutex
-	reminderOpMu sync.Mutex
+	mu            sync.Mutex
+	reminderOpMu  sync.Mutex
+	persistMu     sync.Mutex
+	alarmVolumeMu sync.Mutex
 
 	path    string
 	backend ReminderBackend
@@ -214,6 +216,7 @@ func (m *timerScheduler) stop() {
 	for _, id := range ids {
 		m.stopAlarmLoop(id)
 	}
+	m.restoreAlarmVolume()
 }
 
 func (m *timerScheduler) notify() {
@@ -315,12 +318,7 @@ func (m *timerScheduler) nextDueLocked(now time.Time) time.Time {
 		}
 	}
 	for _, reminder := range m.reminders {
-		if reminder.Deleted || reminder.RemoteKind == RemoteKindEvent {
-			// Calendar events are context, not one-shot reminders. Firing them
-			// would delete the event from Google Calendar after the announcement.
-			continue
-		}
-		if due, ok := reminderDue(reminder.Reminder); ok {
+		if due, ok := scheduledReminderDue(reminder); ok {
 			consider(due.UnixNano())
 		}
 	}
@@ -346,22 +344,6 @@ func (m *timerScheduler) collectDue(now time.Time) []timerEvent {
 		keptTimers = append(keptTimers, timer)
 	}
 	m.timers = keptTimers
-
-	for i := range m.reminders {
-		reminder := &m.reminders[i]
-		if reminder.Deleted || reminder.RemoteKind == RemoteKindEvent {
-			continue
-		}
-		due, ok := reminderDue(reminder.Reminder)
-		if !ok || due.After(now) {
-			continue
-		}
-		events = append(events, timerEvent{Kind: "reminder", ID: reminder.ID, Text: reminder.Text})
-		// Keep a tombstone so an offline delete can be retried, but never fire
-		// the same reminder twice.
-		reminder.Deleted = true
-		reminder.Pending = true
-	}
 
 	keptAlarms := m.alarms[:0]
 	for _, alarm := range m.alarms {
@@ -395,6 +377,12 @@ func (m *timerScheduler) collectDue(now time.Time) []timerEvent {
 		events = append(events, timerEvent{Kind: "sleep", Text: m.sleepLabel})
 		m.sleepDeadline = 0
 		m.sleepLabel = ""
+	}
+
+	for _, reminder := range m.reminders {
+		if due, ok := scheduledReminderDue(reminder); ok && !due.After(now) {
+			events = append(events, timerEvent{Kind: "reminder", ID: reminder.ID, Text: reminder.Text})
+		}
 	}
 
 	return events
@@ -487,7 +475,7 @@ func (m *timerScheduler) startAlarmLoop(event timerEvent) {
 			break
 		}
 	}
-	if !active {
+	if !active || m.stopped {
 		m.mu.Unlock()
 		return
 	}
@@ -561,11 +549,15 @@ func (m *timerScheduler) reminderFired(id string) {
 
 	m.mu.Lock()
 	found := false
+	now := m.now()
 	for i := range m.reminders {
 		if m.reminders[i].ID == id {
-			m.reminders[i].Deleted = true
-			m.reminders[i].Pending = true
-			found = true
+			// Sync may have changed the reminder before we took reminderOpMu.
+			if due, ok := scheduledReminderDue(m.reminders[i]); ok && !due.After(now) {
+				m.reminders[i].Deleted = true
+				m.reminders[i].Pending = true
+				found = true
+			}
 			break
 		}
 	}
@@ -1791,7 +1783,7 @@ func mergeReminders(remote []Reminder, local []reminderRecord) []reminderRecord 
 		}
 		if record.Deleted {
 			if record.Pending {
-				delete(byID, record.ID)
+				put(record)
 			}
 			continue
 		}
@@ -1806,12 +1798,6 @@ func mergeReminders(remote []Reminder, local []reminderRecord) []reminderRecord 
 			}
 		}
 	}
-	for _, record := range local {
-		if record.Deleted && record.Pending {
-			put(record)
-		}
-	}
-
 	out := make([]reminderRecord, 0, len(order))
 	for _, id := range order {
 		if record, ok := byID[id]; ok {
@@ -1846,6 +1832,15 @@ func reminderDue(reminder Reminder) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return due, true
+}
+
+func scheduledReminderDue(record reminderRecord) (time.Time, bool) {
+	// Calendar events and imported tasks can be listed and edited, but passing
+	// their date must not delete them from the user's account.
+	if record.Deleted || record.RemoteKind == RemoteKindEvent || isImportedGoogleTask(record.Reminder) {
+		return time.Time{}, false
+	}
+	return reminderDue(record.Reminder)
 }
 
 func countVisibleReminders(records []reminderRecord) int {
@@ -2049,23 +2044,20 @@ func pauseMediaForSleep() {
 }
 
 func (m *timerScheduler) applyAlarmVolume() {
+	m.alarmVolumeMu.Lock()
+	defer m.alarmVolumeMu.Unlock()
+
 	m.mu.Lock()
 	level := m.alarmVolume
-	if level <= 0 || m.alarmVolumeActive {
-		m.mu.Unlock()
+	skip := m.stopped || m.alarmVolumeActive
+	m.mu.Unlock()
+	if level <= 0 || skip || m.getVolume == nil || m.setVolume == nil {
 		return
 	}
-	m.mu.Unlock()
-	previous := 0
-	if m.getVolume != nil {
-		if v, err := m.getVolume(); err == nil {
-			previous = v
-		}
-	}
-	if m.setVolume != nil {
-		if err := m.setVolume(level); err != nil {
-			return
-		}
+	previous, err := m.getVolume()
+	nativeLevel := (min(level, 100)*nativeVolumeMax + 50) / 100
+	if err != nil || m.setVolume(nativeLevel) != nil {
+		return
 	}
 	m.mu.Lock()
 	m.alarmPrevVolume = previous
@@ -2074,13 +2066,24 @@ func (m *timerScheduler) applyAlarmVolume() {
 }
 
 func (m *timerScheduler) restoreAlarmVolume() {
+	m.alarmVolumeMu.Lock()
+	defer m.alarmVolumeMu.Unlock()
+
 	m.mu.Lock()
+	if !m.stopped {
+		for _, alarm := range m.alarms {
+			if alarm.Active {
+				m.mu.Unlock()
+				return
+			}
+		}
+	}
 	active := m.alarmVolumeActive
 	previous := m.alarmPrevVolume
 	m.alarmVolumeActive = false
 	m.alarmPrevVolume = 0
 	m.mu.Unlock()
-	if active && previous > 0 && m.setVolume != nil {
+	if active && m.setVolume != nil {
 		_ = m.setVolume(previous)
 	}
 }

@@ -140,7 +140,8 @@ func normalizeRFC3339(value string) string {
 	return parsed.UTC().Format(time.RFC3339)
 }
 
-// normalizeDue validates and canonicalises a reminder/task due timestamp.
+// normalizeDue validates a reminder time while preserving its calendar date
+// and offset for date-only task providers.
 func normalizeDue(value string) (string, error) {
 	if value == "" {
 		return "", nil
@@ -149,5 +150,5 @@ func normalizeDue(value string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("due must be RFC3339: %w", err)
 	}
-	return parsed.UTC().Format(time.RFC3339), nil
+	return parsed.Format(time.RFC3339), nil
 }
