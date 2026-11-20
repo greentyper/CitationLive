@@ -98,6 +98,43 @@ class InstallerReadinessTests(unittest.TestCase):
         self.assertEqual(probes, [False, False, False, True])
 
 
+class StockRollbackTests(unittest.TestCase):
+    def test_dry_run_and_declined_confirmation_do_not_apply(self):
+        for dry_run in (True, False):
+            with (
+                self.subTest(dry_run=dry_run),
+                patch.object(installer, "deploy_run", return_value=completed("installed")) as adb,
+                patch.object(installer, "input", return_value="n") as confirm,
+            ):
+                self.assertEqual(installer.rollback_to_stock("speaker", dry_run=dry_run), dry_run)
+                self.assertEqual(confirm.call_count, int(not dry_run))
+                commands = [call.args[0][-1] for call in adb.call_args_list]
+                self.assertFalse(any(" apply " in command or command == "reboot" for command in commands))
+
+    def test_reboot_verification_requires_a_new_boot_id(self):
+        starts = iter(["a" * 36, "a" * 36, "b" * 36])
+
+        def run(command, **kwargs):
+            last = command[-1]
+            if last.endswith("boot_id"):
+                return completed(next(starts))
+            for operation, reply in (("probe", "installed"), ("apply", "pending-reboot"), ("verify", "stock")):
+                if f" {operation} " in last:
+                    return completed(reply)
+            return completed()
+
+        def wait(_, ready, **kwargs):
+            self.assertFalse(ready())
+            return ready()
+
+        with (
+            patch.object(installer, "deploy_run", side_effect=run),
+            patch.object(installer, "spinner_wait", side_effect=wait),
+            patch.object(installer, "log"),
+        ):
+            self.assertTrue(installer.rollback_to_stock("speaker", confirmed=True))
+
+
 class AutoUpdateReadinessTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

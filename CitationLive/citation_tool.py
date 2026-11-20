@@ -8,10 +8,12 @@ import hashlib
 import ipaddress
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 import webbrowser
 from datetime import datetime, timezone
 
@@ -560,7 +562,7 @@ def deploy_run(*args, **kwargs):
     except ValueError:
         remote_code = -1
     if remote_code != 0:
-        raise subprocess.CalledProcessError(remote_code, command)
+        raise subprocess.CalledProcessError(remote_code, command, output=body, stderr=result.stderr)
     result.stdout = body.rstrip()
     return result
 
@@ -596,6 +598,88 @@ def create_install_backup(adb_serial):
 
 
 AUTO_UPDATE_SCRIPT = '/data/opt/citation-gemini/bin/auto_update.sh'
+
+
+def rollback_to_stock(adb_serial, *, dry_run=False, confirmed=False):
+    script = ROOT / 'runtime' / 'rollback_to_stock.sh'
+    hook = ROOT / 'runtime' / 'alsa_looper.sh'
+    if not script.is_file() or not hook.is_file():
+        log(ui('Файлы отката отсутствуют.', 'Rollback files are missing.'), 'ERR')
+        return False
+
+    digest = hashlib.sha256(hook.read_bytes()).hexdigest()
+    remote = f'/tmp/citation-stock-{uuid.uuid4().hex}.sh'
+    adb = [str(ADB), '-s', adb_serial]
+
+    def shell(command):
+        return deploy_run(adb + ['shell', command], text=True, errors='replace', timeout=10).stdout.strip()
+
+    def stage():
+        deploy_run(adb + ['push', str(script), remote], capture_output=True, timeout=10)
+
+    def run(action):
+        return shell(f'/bin/sh {remote} {action} {digest}')
+
+    boot_id_command = 'cat /proc/sys/kernel/random/boot_id'
+    try:
+        stage()
+        state = run('probe')
+        if state == 'stock':
+            log(ui('Штатное ПО уже работает.', 'Stock software is already running.'), 'OK')
+            return True
+        if state not in ('installed', 'pending-reboot'):
+            return False
+        if dry_run:
+            print(ui('Доступен откат CitationLive к штатному ПО.', 'CitationLive can be rolled back to stock.')
+                  if state == 'installed' else
+                  ui('Для завершения отката нужна перезагрузка.', 'Reboot required to finish rollback.'))
+            return True
+        if not confirmed:
+            answer = input(ui('Архивировать CitationLive и перезагрузить колонку в штатное ПО? [y/N]: ',
+                              'Archive CitationLive and reboot into stock software? [y/N]: ')).strip().lower()
+            if answer not in ('y', 'yes', 'д', 'да'):
+                return False
+
+        old_boot_id = shell(boot_id_command)
+        if not re.fullmatch(r'[0-9a-f-]{36}', old_boot_id):
+            return False
+        archive = run('apply')
+        if archive.startswith('/data/opt/citationlive-stock-backups/stock.'):
+            log(ui(f'Файлы CitationLive сохранены на колонке в {archive}',
+                   f'CitationLive files are archived on the speaker in {archive}'), 'OK')
+        elif archive != 'pending-reboot':
+            return False
+
+        deploy_run(adb + ['reboot'], capture_output=True, timeout=10)
+
+        def stock_ready():
+            try:
+                if adb_serial.endswith(':5555'):
+                    subprocess.run([str(ADB), 'connect', adb_serial], capture_output=True, timeout=3)
+                boot_id = shell(boot_id_command)
+                if boot_id == old_boot_id or not re.fullmatch(r'[0-9a-f-]{36}', boot_id):
+                    return False
+                stage()
+                return run('verify') == 'stock'
+            except (subprocess.SubprocessError, OSError):
+                return False
+
+        if spinner_wait(ui('Проверка штатного ПО', 'Checking stock software'), stock_ready, timeout=90):
+            log(ui('Откат к штатному ПО подтверждён.', 'Rollback to stock verified.'), 'OK')
+            return True
+        log(ui('Колонка не прошла проверку после перезагрузки. Проверьте подключение и повторите откат.',
+               'The speaker could not be verified after reboot. Check the connection and rerun rollback.'), 'WARN')
+        return False
+    except (subprocess.SubprocessError, OSError) as exc:
+        output = getattr(exc, 'output', None)
+        reason = output.strip() if isinstance(output, str) else ''
+        log(ui('Откат не подтверждён. ', 'Rollback was not verified. ') + reason, 'ERR')
+        return False
+    finally:
+        try:
+            shell(f'rm -f {remote}')
+        except (subprocess.SubprocessError, OSError):
+            pass
 
 
 def configure_auto_updates(adb_serial, offer=False):
@@ -1485,18 +1569,18 @@ def interactive_menu(target_ip=None):
                  '     Дополнительные настройки:\n'
                  ' [5] Подключить Spotify\n [6] Подключить Google Календарь и Задачи\n'
                  ' [7] Google News — лента из аккаунта\n [8] Настроить DNS / прокси Gemini\n'
-                 ' [9] Выбрать другую колонку\n [10] Веб-авторизация Google News\n [11] Автообновления CitationLive\n [0] Выход',
+                 ' [9] Выбрать другую колонку\n [10] Веб-авторизация Google News\n [11] Автообновления CitationLive\n [12] Откат к штатному ПО\n [0] Выход',
                  ' [1] All in one — Gemini, Spotify, Google and News\n'
                  ' [2] Check speaker connection\n [3] Connect speaker / enable network access\n'
                  ' [4] Reinstall CitationLive\n     Optional services:\n'
                  ' [5] Connect Spotify\n [6] Connect Google Calendar and Tasks\n'
                  ' [7] Google News — account feed\n [8] Configure Gemini DNS / proxy\n'
-                 ' [9] Select another speaker\n [10] Google News browser sign-in\n [11] CitationLive automatic updates\n [0] Exit'))
-        choice = input(ui('Выберите пункт [0–11]: ', 'Choose [0–11]: ')).strip()
+                 ' [9] Select another speaker\n [10] Google News browser sign-in\n [11] CitationLive automatic updates\n [12] Roll back to stock\n [0] Exit'))
+        choice = input(ui('Выберите пункт [0–12]: ', 'Choose [0–12]: ')).strip()
         if choice == '0':
             return
-        if not choice.isdigit() or not (0 <= int(choice) <= 11):
-            print(ui('Введите номер пункта от 0 до 11.', 'Enter a number from 0 to 11.'))
+        if not choice.isdigit() or not (0 <= int(choice) <= 12):
+            print(ui('Введите номер пункта от 0 до 12.', 'Enter a number from 0 to 12.'))
             continue
         choice = str(int(choice))
         if choice == '9' or not target_ip:
@@ -1547,6 +1631,8 @@ def interactive_menu(target_ip=None):
                 configure_dns(target_ip)
             elif choice == '11':
                 configure_auto_updates(ident)
+            elif choice == '12':
+                rollback_to_stock(ident)
         except (subprocess.SubprocessError, OSError) as exc:
             print(ui('Операция прервана. Проверьте соединение с колонкой и повторите пункт меню.',
                      'Operation interrupted. Check the speaker connection and retry the menu option.'))
@@ -1555,12 +1641,16 @@ def interactive_menu(target_ip=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', nargs='?', choices=['run', 'status', 'pipeline', 'install', 'spotify', 'google'], default='run')
+    parser.add_argument('command', nargs='?', choices=['run', 'status', 'pipeline', 'install', 'spotify', 'google', 'rollback'], default='run')
     parser.add_argument('--ip', help='Speaker network IP address')
     parser.add_argument('--key', help='Gemini API key')
     parser.add_argument('--force', action='store_true', help='Allow install on non-tested hardware with active ADB')
     parser.add_argument('--lang', choices=['ru', 'en'], default=None, help='UI language / язык интерфейса')
+    parser.add_argument('--dry-run', action='store_true', help='Check rollback availability without applying it')
+    parser.add_argument('--yes', action='store_true', help='Confirm rollback and reboot without an interactive prompt')
     args = parser.parse_args()
+    if args.command != 'rollback' and (args.dry_run or args.yes):
+        parser.error('--dry-run and --yes are only available with rollback')
 
     global LANG
     if args.lang:
@@ -1573,6 +1663,14 @@ def main():
     elif args.command == 'status':
         mode, ident = detect_mode(args.ip)
         print(json.dumps({'mode': mode, 'identifier': ident}))
+    elif args.command == 'rollback':
+        if not args.ip:
+            parser.error('rollback requires an explicit --ip')
+        _, ident = detect_mode(args.ip)
+        if not ident:
+            log(ui('Колонка не обнаружена по ADB.', 'Speaker not reachable over ADB.'), 'ERR')
+            return 1
+        return 0 if rollback_to_stock(ident, dry_run=args.dry_run, confirmed=args.yes) else 1
     elif args.command == 'install':
         mode, ident = detect_mode(args.ip)
         target = ident or args.ip
