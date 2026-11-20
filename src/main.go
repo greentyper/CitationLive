@@ -122,6 +122,7 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 		{"name": "get_volume", "description": "Read the current speaker volume. Use for «какая сейчас громкость?» or «на какой громкости?». Report the returned percent.", "parameters": M{"type": "OBJECT", "properties": M{}}},
 		{"name": "adjust_volume", "description": "Adjust speaker volume in native steps (-6 to +6). For «потише» or «тише» use -3. For «погромче» or «громче» use +3.", "parameters": M{"type": "OBJECT", "properties": M{"delta": M{"type": "INTEGER", "minimum": -6, "maximum": 6}}, "required": []string{"delta"}}},
 		{"name": "media_control", "description": "Control existing speaker music playback", "parameters": M{"type": "OBJECT", "properties": M{"action": M{"type": "STRING", "enum": []string{"pause", "resume", "next", "previous", "stop"}}}, "required": []string{"action"}}},
+		{"name": "speaker_bluetooth", "description": "Control the Bluetooth radio on this speaker. Use on for «включи Bluetooth» or turn on Bluetooth, off for «выключи Bluetooth», «отключи блютуз» or turn off Bluetooth, and status for «включён ли Bluetooth?». Report the enabled state only after a successful result.", "parameters": M{"type": "OBJECT", "properties": M{"action": M{"type": "STRING", "enum": []string{"on", "off", "status"}}}, "required": []string{"action"}}},
 		{"name": "spotify_dj_prompt", "description": "Send a live voice request to Spotify AI DJ (use whenever the user addresses DJ or asks DJ to play/change something: «диджей включи ...», «диджей поставь ...», «эй диджей ...», «попроси диджея ...», «спроси у диджея ...», «скажи диджею ...», «в диджее включи ...», «DJ play ...», «hey DJ ...»). IMPORTANT: Spotify AI DJ only understands English prompts! You MUST translate the user's Russian request into a concise, natural English DJ prompt in the `prompt` parameter (for example: «диджей включи что-нибудь новое» -> prompt='play something new and fresh', «диджей поставь весёлый рок» -> prompt='upbeat energetic rock', «диджей что-нибудь спокойное на вечер» -> prompt='chill relaxing evening vibes', «диджей включи хиты девяностых» -> prompt='90s hits'). Do NOT call play_music when the user addresses DJ with a prompt/vibe — ALWAYS call spotify_dj_prompt with an English prompt!", "parameters": M{"type": "OBJECT", "properties": M{"prompt": M{"type": "STRING", "description": "The music prompt or vibe for Spotify DJ, ALWAYS translated into concise natural English (e.g. 'play something new', 'upbeat electronic music', 'chill late night vibes')."}}, "required": []string{"prompt"}}},
 	}}}}}
 	setup["setup"].(M)["generationConfig"].(M)["speechConfig"] = M{"voiceConfig": M{"prebuiltVoiceConfig": M{"voiceName": geminiLiveVoice()}}}
@@ -347,6 +348,9 @@ func toolContext(ctx context.Context, name string, args M) M {
 		return result
 	}
 	switch name {
+	case "speaker_bluetooth":
+		action, _ := args["action"].(string)
+		return controlBluetooth(ctx, action)
 	case "get_volume":
 		level, err := nativeVolume()
 		if err != nil {
@@ -2422,6 +2426,17 @@ func main() {
 	}
 	if mode == "info" {
 		fmt.Printf(`{"native":true,"architecture":%q,"glibc_required":false,"go_version":%q}`+"\n", runtime.GOARCH, runtime.Version())
+		return
+	}
+	if mode == "bluetooth" {
+		if len(os.Args) != 3 {
+			log.Fatal("bluetooth requires on, off or status")
+		}
+		result := tool("speaker_bluetooth", M{"action": os.Args[2]})
+		_ = json.NewEncoder(os.Stdout).Encode(result)
+		if result["ok"] != true {
+			os.Exit(1)
+		}
 		return
 	}
 	if mode == "clean-ipc" {

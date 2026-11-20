@@ -16,7 +16,7 @@ type commandAction struct {
 }
 
 func (g *commandGate) allowAction(now time.Time, name string) bool {
-	family := map[string]string{"set_volume": "volume", "adjust_volume": "volume", "media_control": "media", "play_music": "music", "spotify_dj_prompt": "music", "spotify_playback": "spotify_playback", "set_home_city": "preferences", "end_session": "session"}[name]
+	family := map[string]string{"set_volume": "volume", "adjust_volume": "volume", "media_control": "media", "play_music": "music", "spotify_dj_prompt": "music", "speaker_bluetooth": "bluetooth", "spotify_playback": "spotify_playback", "set_home_city": "preferences", "end_session": "session"}[name]
 	if family == "" {
 		return true
 	}
