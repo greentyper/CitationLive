@@ -23,26 +23,47 @@ func TestDirectClientRefusesPublicWebAPI(t *testing.T) {
 	}
 }
 
-func TestGenericMusicUsesPlayableLibraryPlaylist(t *testing.T) {
-	client := &spotifyClient{
-		deviceID: "citation", token: func(context.Context) (string, error) { return "test", nil },
+func TestGenericMusicDoesNotSelectAnOrdinaryPlaylist(t *testing.T) {
+	client := &spotifyClient{}
+	args := literalMusicFields(M{"track": "Example Set", "music_type": "playlist", "playlist_mode": "named"}, "Ну, включи музыку.")
+	got := client.resolve(prepareMusic(args))
+	if got["ok"] != true || got["spotify_generic"] != true || got["spotify_uri"] != nil {
+		t.Fatalf("generic request selected a specific playlist: %v", got)
 	}
-	client.http = &http.Client{Transport: spotifyTestTransport(func(r *http.Request) (*http.Response, error) {
-		var body string
-		switch r.URL.Path {
-		case "/v1/me/playlists":
-			body = `{"items":[{"name":"DJ","uri":"` + spotifyDJURI + `"},{"name":"Library mix","uri":"spotify:playlist:library"}]}`
-		case "/v1/me/player/devices":
-			body = `{"devices":[{"id":"other","type":"Speaker"},{"id":"citation","type":"Speaker"}]}`
-		default:
-			t.Fatalf("unexpected Spotify request: %s", r.URL.Path)
+}
+
+func TestGenericMixAlternatesOnlyAfterSuccessfulPlayback(t *testing.T) {
+	client := &spotifyClient{}
+	failed := ""
+	var attempts []string
+	play := func(_ context.Context, source string) M {
+		attempts = append(attempts, source)
+		if source == failed {
+			return M{"ok": false, "error": "unavailable"}
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body))}, nil
-	})}
-	request := prepareMusic(M{"music_type": "playlist", "spoken_request": "включи музыку"})
-	got := client.resolve(request)
-	if got["ok"] != true || got["spotify_uri"] != "spotify:playlist:library" || got["spotify_device_id"] != "citation" {
-		t.Fatalf("unexpected playlist selection: %v", got)
+		return M{"ok": true, "backend": "spotify_api"}
+	}
+	selection := client.resolve(prepareMusic(M{"music_type": "playlist"}))
+	for _, step := range []struct {
+		unavailable string
+		want        string
+	}{
+		{"", "DJ"},
+		{"", "daylist"},
+		{"DJ", "daylist"},
+		{"", "DJ"},
+	} {
+		failed = step.unavailable
+		got := client.playGenericMixLocked(context.Background(), play)
+		if !musicMatches(selection, got) || got["spotify_generic_source"] != step.want {
+			t.Fatalf("expected %q, got %v", step.want, got)
+		}
+	}
+	if actual := strings.Join(attempts, ","); actual != "DJ,daylist,DJ,daylist,DJ" {
+		t.Fatalf("unexpected order %s", actual)
+	}
+	if musicMatches(selection, M{"ok": true, "backend": "spotify_api", "selected_uri": "spotify:playlist:unrelated"}) {
+		t.Fatal("an unrelated playlist was accepted as a generic mix")
 	}
 }
 
@@ -216,12 +237,12 @@ func TestDaylistPlaylistMatching(t *testing.T) {
 		name, description, uri string
 		ok                     bool
 	}{
-		{"funky soul funktastic sunday night", "Here's some funky soul — inspired by your listening on Sundays at night", "spotify:playlist:37i9dQZF1EP6YuccBxUcC1", true},
+		{"Example evening mix", "A playlist inspired by your listening", "spotify:playlist:fixture-daylist", true},
 		{"daylist", "", "", true},
 		{"Твой день", "Твой день в плейлисте", "", true},
 		{"Quiet Atlas", "Ambient music", "spotify:playlist:fixture-ambient", false},
-		{"Your Top Songs 2022", "Spotify Wrapped presents the songs that you loved most this year.", "spotify:playlist:37i9dQZF1F0sijgNaJdgit", false},
-		{"Personalized", "", "spotify:playlist:37i9dQZF1EP6YuccBxUcC1", true},
+		{"Your Top Songs 2022", "Spotify Wrapped presents the songs that you loved most this year.", "spotify:playlist:fixture-wrapped", false},
+		{"Personalized", "", "spotify:playlist:37i9dQZF1EP-fixture", true},
 	}
 	for _, tc := range cases {
 		if got := isDaylistPlaylist(tc.name, tc.description, tc.uri); got != tc.ok {

@@ -28,6 +28,7 @@ import (
 type spotifyClient struct {
 	mu               sync.Mutex
 	playbackMu       sync.Mutex
+	lastGenericMix   string // guarded by playbackMu
 	deviceID         string
 	paired           bool
 	contextName      string
@@ -681,41 +682,9 @@ func (s *spotifyClient) resolve(request M) (result M) {
 	personalMode := ""
 	if surprise {
 		name, kind, personalMode = "удиви меня", "playlist", "surprise"
-	} else if (genericMusic || surprise) && artist == "" && request["playlist_mode"] != "named" {
-		// A generic request can play a regular playlist from the user's library.
-		// DJ and Daylist need extra Spotify features and can fail on this account.
-		var library spotifyPlaylistPage
-		libraryErr := s.api("GET", "/me/playlists?limit=50", nil, &library)
-		if libraryErr == nil {
-			_, previous, _ := s.playbackContext()
-			if s == directSpotify {
-				native := readSpotifyNative()
-				if strings.HasPrefix(native.ContextURI, "spotify:playlist:") {
-					previous = native.ContextURI
-				}
-			}
-			var selected *spotifyEntity
-			for i := range library.Items {
-				playlist := &library.Items[i]
-				if !strings.HasPrefix(playlist.URI, "spotify:playlist:") || playlist.URI == spotifyDJURI ||
-					playlist.Name == "" || spotifyPersonalPlaylist(playlist.Name) != "" ||
-					(s == directSpotify && playlist.Items.Total == 0) {
-					continue
-				}
-				selected = playlist
-				if playlist.URI != previous {
-					break
-				}
-			}
-			if selected != nil {
-				spokenQuery, _ := request["query"].(string)
-				return s.spotifySelection(selected, "playlist", selected.Name, "", spokenQuery)
-			}
-		}
-		if s == directSpotify && libraryErr != nil {
-			return M{"ok": false, "error": "Не удалось прочитать библиотеку Spotify на колонке."}
-		}
-		name, kind = "спокойная музыка", "playlist"
+	} else if genericMusic && artist == "" && request["playlist_mode"] != "named" {
+		return M{"ok": true, "status": "ready_to_play", "backend": "spotify_api",
+			"spotify_generic": true, "announcement": "Включаю музыку в Spotify."}
 	} else if artist == "" {
 		if personal := spotifyPersonalPlaylist(name); personal != "" {
 			name, kind, personalMode = personal, "playlist", personal
@@ -728,18 +697,12 @@ func (s *spotifyClient) resolve(request M) (result M) {
 		return s.spotifySelection(&item, "playlist", name, "", spokenQuery)
 	}
 	if s == directSpotify && personalMode == "daylist" {
-		var library spotifyPlaylistPage
-		if err := s.api("GET", "/me/playlists?limit=50", nil, &library); err == nil {
-			for _, playlist := range library.Items {
-				if isDaylistPlaylist(playlist.Name, playlist.Description, playlist.URI) && playlist.URI != spotifyDJURI {
-					spokenQuery, _ := request["query"].(string)
-					selection := s.spotifySelection(&playlist, "playlist", playlist.Name, "", spokenQuery)
-					selection["context_type"] = "playlist"
-					return selection
-				}
-			}
+		playlist, err := s.findDaylist(context.Background())
+		if err != nil {
+			return M{"ok": false, "error": err.Error()}
 		}
-		return M{"ok": false, "error": "Daylist не найден в библиотеке Spotify."}
+		spokenQuery, _ := request["query"].(string)
+		return s.spotifySelection(&playlist, "playlist", playlist.Name, "", spokenQuery)
 	}
 
 	cleanedName := cleanMusicKeywords(name)
@@ -1235,6 +1198,9 @@ func (s *spotifyClient) playContext(ctx context.Context, selection M) (out M) {
 			out["play_ms"] = time.Since(started).Milliseconds()
 		}
 	}()
+	if selection["spotify_generic"] == true {
+		return s.playGenericMixLocked(ctx, s.playPersonalMix)
+	}
 	uri, _ := selection["spotify_uri"].(string)
 	device, _ := selection["spotify_device_id"].(string)
 	nativeDevice, _ := selection["spotify_device_native"].(bool)

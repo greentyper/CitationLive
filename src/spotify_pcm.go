@@ -66,12 +66,17 @@ func spotifyNativeCommand(ctx context.Context, action string, args M) error {
 }
 
 // Spotify Connect keeps manually queued tracks when a new context is loaded.
+// Clear them without releasing the active Connect device during replacement.
 func resetSpotifyBeforePlay(ctx context.Context) error {
 	native := readSpotifyNative()
 	if native.ContextURI == "" && native.Track.URI == "" {
 		return nil
 	}
-	return spotifyNativeCommand(ctx, "stop", M{})
+	return prepareSpotifyReplacement(ctx)
+}
+
+func prepareSpotifyReplacement(ctx context.Context) error {
+	return spotifyNativeCommand(ctx, "stop", M{"keep_session": true})
 }
 
 func waitSpotifyReady(ctx context.Context, timeout time.Duration) bool {
@@ -137,7 +142,7 @@ func playSpotifyNative(ctx context.Context, selection M, device, uri, kind strin
 		}
 		if attempt == 14 && !retried && status.Buffering && status.Track.URI == "" {
 			retried = true
-			_ = spotifyNativeCommand(ctx, "stop", M{})
+			_ = prepareSpotifyReplacement(ctx)
 			if !waitSpotifyReady(ctx, 5*time.Second) {
 				return M{"ok": false, "error": "Проигрыватель Spotify не отвечает."}
 			}
@@ -416,14 +421,14 @@ func syncSpotifyNativeVolume() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				uri := status.ContextURI
 				paused := status.Paused
-				_ = spotifyNativeCommand(ctx, "stop", M{})
+				_ = prepareSpotifyReplacement(ctx)
 				if isNativeDJContext(uri) {
 					device := status.DeviceID
 					if device == "" {
 						device = directSpotify.boundDeviceID()
 					}
 					if device != "" {
-						_ = playSpotifyDJ(ctx, device)
+						_ = startSpotifyDJ(ctx, device, "state_restore")
 					}
 				} else {
 					_ = spotifyNativeCommand(ctx, "play", M{"uri": uri, "paused": paused})

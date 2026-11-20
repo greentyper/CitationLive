@@ -227,6 +227,10 @@ func literalMusicFields(args M, transcript string) M {
 
 func musicMatches(request M, result M) bool {
 	if request["backend"] == "spotify_api" {
+		if request["spotify_generic"] == true {
+			return result["backend"] == "spotify_api" && result["ok"] == true &&
+				(result["spotify_generic_source"] == "DJ" || result["spotify_generic_source"] == "daylist")
+		}
 		return result["backend"] == "spotify_api" && result["selected_uri"] == request["spotify_uri"] && result["ok"] == true
 	}
 	track, _ := request["requested_track"].(string)

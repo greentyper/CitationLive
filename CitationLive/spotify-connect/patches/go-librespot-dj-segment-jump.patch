@@ -1,0 +1,792 @@
+diff --git a/daemon/api_server.go b/daemon/api_server.go
+index 3c86836..ee0c862 100644
+--- a/daemon/api_server.go
++++ b/daemon/api_server.go
+@@ -140,6 +140,7 @@ const (
+ 	ApiRequestTypePlaylistAddTracks   ApiRequestType = "playlist_add_tracks"
+ 	ApiRequestTypePlaylistRemoveTrack ApiRequestType = "playlist_remove_track"
+ 	ApiRequestTypePlaylistContains    ApiRequestType = "playlist_contains"
++	ApiRequestTypeDJPrompt            ApiRequestType = "dj_prompt"
+ )
+ 
+ // ApiRequestDataContextTracks carries the uri query parameter of the context
+@@ -681,8 +682,17 @@ func (s *ConcreteApiServer) PlayerPlayPause(w http.ResponseWriter, _ *http.Reque
+ 	s.handleRequest(ApiRequest{Type: ApiRequestTypePlayPause}, w)
+ }
+ 
+-func (s *ConcreteApiServer) PlayerStop(w http.ResponseWriter, _ *http.Request) {
+-	s.handleRequest(ApiRequest{Type: ApiRequestTypeStop}, w)
++func (s *ConcreteApiServer) PlayerStop(w http.ResponseWriter, r *http.Request) {
++	var body struct {
++		KeepSession bool `json:"keep_session"`
++	}
++	if r.Body != nil && r.ContentLength != 0 {
++		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&body); err != nil && err != io.EOF {
++			http.Error(w, "invalid stop request", http.StatusBadRequest)
++			return
++		}
++	}
++	s.handleRequest(ApiRequest{Type: ApiRequestTypeStop, Data: body.KeepSession}, w)
+ }
+ 
+ func (s *ConcreteApiServer) PlayerPrev(w http.ResponseWriter, _ *http.Request) {
+@@ -873,6 +883,20 @@ func (s *ConcreteApiServer) GetEvents(w http.ResponseWriter, r *http.Request) {
+ 
+ func (s *ConcreteApiServer) serve() {
+ 	m := http.NewServeMux()
++	m.HandleFunc("/player/dj_prompt", func(w http.ResponseWriter, r *http.Request) {
++		if r.Method != http.MethodPost {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		var body struct {
++			Prompt string `json:"prompt"`
++		}
++		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Prompt == "" {
++			http.Error(w, "missing prompt", http.StatusBadRequest)
++			return
++		}
++		s.handleRequest(ApiRequest{Type: ApiRequestTypeDJPrompt, Data: body.Prompt}, w)
++	})
+ 	handler := HandlerFromMux(s, m)
+ 
+ 	c := cors.New(cors.Options{
+diff --git a/daemon/app.go b/daemon/app.go
+index 6376f59..4cdb33a 100644
+--- a/daemon/app.go
++++ b/daemon/app.go
+@@ -282,6 +282,7 @@ func (app *App) newAppPlayer(ctx context.Context, creds any) (_ *AppPlayer, err
+ 		logout:          app.logoutCh,
+ 		volumeUpdate:    make(chan float32, 1),
+ 		playbackReadyCh: make(chan struct{}),
++		djPromptDone:    make(chan bool, 2),
+ 	}
+ 
+ 	defer func() {
+diff --git a/daemon/cluster_test.go b/daemon/cluster_test.go
+index e8f8f9f..2387cf4 100644
+--- a/daemon/cluster_test.go
++++ b/daemon/cluster_test.go
+@@ -93,3 +93,19 @@ func TestPlayYieldsToAThirdDevice(t *testing.T) {
+ 
+ 	require.False(t, p.state.active)
+ }
++
++// Replacing music locally discards the old context without briefly logging
++// out of Spotify or handing the active device back to the account.
++func TestPrepareReplacementKeepsActiveConnectSession(t *testing.T) {
++	p := playOverOtherDevice(t, 1000)
++	p.app.cfg.ZeroconfEnabled = true
++
++	_, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeStop, Data: true})
++
++	require.NoError(t, err)
++	requireIdle(t, p)
++	deferred, err := p.handleApiRequest(ApiRequest{Type: ApiRequestTypeStop})
++	require.NoError(t, err)
++	require.Nil(t, deferred)
++	require.False(t, p.state.active)
++}
+diff --git a/daemon/controls.go b/daemon/controls.go
+index cfe8540..62019a2 100644
+--- a/daemon/controls.go
++++ b/daemon/controls.go
+@@ -349,21 +349,33 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ 	}
+ 
+ 	// The previous context's surroundings do not describe this one, and the new
+-	// track is not known until the context resolves. The stream that was
+-	// playing carries on until then and may still raise events, so nothing on
+-	// the loop may assume Track is set.
+-	p.state.player.Track = nil
++	// track is not known until the context resolves. Keep Track non-nil if one
++	// was already playing so mobile Spotify controllers (especially DJ sheet
++	// collectors calling playerState.track().get()) never see Optional.empty()
++	// during the resolve window.
++	prevMeta := p.state.player.ContextMetadata
+ 	p.state.player.PrevTracks = nil
+ 	p.state.player.NextTracks = nil
+ 	p.state.player.Index = nil
+ 	p.state.player.ContextMetadata = contextMetadata(spotCtx.Metadata, nil)
++	if p.isDJContext() || p.djPromptPending || prevMeta["lexicon_set_type"] == "your_dj" {
++		p.ensureDJMetadata()
++		if st := prevMeta["interactivity_state"]; st != "" {
++			p.state.player.ContextMetadata["interactivity_state"] = st
++		}
++		if resp := prevMeta["interactivity_response"]; resp != "" {
++			p.state.player.ContextMetadata["interactivity_response"] = resp
++		}
++	}
+ 
+ 	p.state.player.Timestamp = time.Now().UnixMilli()
+ 	p.state.player.PositionAsOfTimestamp = 0
+ 	p.state.player.IsPlaying = true
+ 	p.state.player.IsBuffering = true
+ 	p.state.player.PlaybackSpeed = 0
+-	p.updateState()
++	if p.state.player.Track != nil {
++		p.updateState()
++	}
+ 
+ 	shuffle := p.state.player.Options.ShufflingContext
+ 	p.loadGen++
+@@ -392,9 +404,28 @@ func (p *AppPlayer) loadContext(spotCtx *connectpb.Context, skipTo skipToFunc, p
+ 
+ 			return loaderResult{
+ 				commit: func(p *AppPlayer, err error) {
++					prevMeta := p.state.player.ContextMetadata
+ 					p.state.tracks = list
+ 					p.state.player.ContextMetadata = contextMetadata(spotCtx.Metadata, snap.Metadata)
++					if p.isDJContext() || p.djPromptPending || prevMeta["lexicon_set_type"] == "your_dj" {
++						p.ensureDJMetadata()
++						if st := prevMeta["interactivity_state"]; st != "" {
++							p.state.player.ContextMetadata["interactivity_state"] = st
++						}
++						if resp := prevMeta["interactivity_response"]; resp != "" {
++							p.state.player.ContextMetadata["interactivity_response"] = resp
++						}
++					}
+ 					p.publishSnapshot(snap)
++					if p.djPromptPending && p.state.player.Track != nil {
++						var fakeId [16]byte
++						_, _ = rand.Read(fakeId[:])
++						p.state.player.PlaybackId = hex.EncodeToString(fakeId[:])
++						p.state.player.ContextMetadata["interactivity_response"] = "play"
++						delete(p.state.player.ContextMetadata, "interactivity_state")
++						p.djPromptPending = false
++						p.flushState()
++					}
+ 					p.scheduleContextMetaPrefetch(spotCtx.Uri)
+ 
+ 					// skip forward if the track it landed on (or a run of them) is unplayable.
+@@ -539,7 +570,17 @@ func (p *AppPlayer) transferContext(transferState *connectpb.TransferState, sent
+ 
+ 					p.state.queueID = highestQueueID(queue.GetTracks())
+ 					p.state.tracks = list
++					prevMeta := p.state.player.ContextMetadata
+ 					p.state.player.ContextMetadata = contextMetadata(played.Metadata, snap.Metadata)
++					if p.isDJContext() || p.djPromptPending || prevMeta["lexicon_set_type"] == "your_dj" {
++						p.ensureDJMetadata()
++						if st := prevMeta["interactivity_state"]; st != "" {
++							p.state.player.ContextMetadata["interactivity_state"] = st
++						}
++						if resp := prevMeta["interactivity_response"]; resp != "" {
++							p.state.player.ContextMetadata["interactivity_response"] = resp
++						}
++					}
+ 					p.publishSnapshot(snap)
+ 					p.scheduleContextMetaPrefetch(played.Uri)
+ 
+@@ -1035,7 +1076,18 @@ func (p *AppPlayer) commitLoad(stream *player.Stream, uri string, paused bool, t
+ 	p.state.player.IsPlaying = true
+ 	p.state.player.IsBuffering = false
+ 	p.state.setPaused(paused) // update IsPaused and PlaybackSpeed
+-	p.updateState()
++	if p.djPromptPending {
++		p.ensureDJMetadata()
++		p.state.player.ContextMetadata["interactivity_response"] = "play"
++		delete(p.state.player.ContextMetadata, "interactivity_state")
++		p.djPromptPending = false
++		p.flushState()
++	} else if p.isDJContext() {
++		p.ensureDJMetadata()
++		p.flushState()
++	} else {
++		p.updateState()
++	}
+ 	p.schedulePrefetchNext()
+ 
+ 	p.app.server.Emit(&ApiEvent{
+@@ -1717,7 +1769,7 @@ func (p *AppPlayer) volumeUpdated() {
+ 	})
+ }
+ 
+-func (p *AppPlayer) stopPlayback() {
++func (p *AppPlayer) cancelPlaybackLoads() {
+ 	// Whatever is being loaded is not wanted any more. Cancel it, and make
+ 	// sure a result that lands anyway is thrown away rather than published
+ 	// over the inactive state below; the events the player raised for it go
+@@ -1727,7 +1779,10 @@ func (p *AppPlayer) stopPlayback() {
+ 	p.loader.dropLoads()
+ 	p.loadInFlight = false
+ 	p.pendingPlayerEvents = nil
++}
+ 
++func (p *AppPlayer) stopPlayback() {
++	p.cancelPlaybackLoads()
+ 	p.player.Stop()
+ 	p.primaryStream = nil
+ 	p.secondaryStream = nil
+diff --git a/daemon/dj_segment_jump.go b/daemon/dj_segment_jump.go
+new file mode 100644
+index 0000000..97710ea
+--- /dev/null
++++ b/daemon/dj_segment_jump.go
+@@ -0,0 +1,48 @@
++package daemon
++
++import (
++	"context"
++	"fmt"
++	"time"
++
++	"github.com/devgianlu/go-librespot/tracks"
++)
++
++func (p *AppPlayer) jumpDJSegment() error {
++	if p.state.player.GetContextMetadata()["lexicon_set_type"] != "your_dj" ||
++		p.state.tracks == nil || !p.state.active {
++		return fmt.Errorf("no active DJ context")
++	}
++	if p.loadInFlight || p.state.player.IsBuffering {
++		return fmt.Errorf("DJ track is still loading")
++	}
++
++	delay := p.noteSkip()
++	p.loadGen++
++	p.listJob("next DJ segment", classLoad, nil,
++		func(ctx context.Context, list *tracks.List) error {
++			ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
++			defer cancel()
++			return list.JumpToNextDJSegment(ctx)
++		},
++		func(p *AppPlayer, snap *tracks.Snapshot, err error) {
++			if err != nil {
++				p.app.log.WithError(err).Warn("failed jumping to the next DJ segment")
++				return
++			}
++
++			delete(p.state.player.ContextMetadata, "interactivity_state")
++			delete(p.state.player.ContextMetadata, "interactivity_response")
++			p.narrationJumped = true
++			p.publishSnapshot(snap)
++			p.state.player.Timestamp = time.Now().UnixMilli()
++			p.state.player.PositionAsOfTimestamp = 0
++			p.loadCurrentTrack(p.state.player.IsPaused, true, true, delay, func(err error) {
++				if err != nil {
++					p.app.log.WithError(err).Warn("failed loading the next DJ segment")
++				}
++			})
++		})
++
++	return nil
++}
+diff --git a/daemon/dj_signal.go b/daemon/dj_signal.go
+new file mode 100644
+index 0000000..18e0dd8
+--- /dev/null
++++ b/daemon/dj_signal.go
+@@ -0,0 +1,241 @@
++package daemon
++
++import (
++	"context"
++	"encoding/base64"
++	"errors"
++	"io"
++	"net/http"
++	"strings"
++	"time"
++
++	"github.com/devgianlu/go-librespot/dealer"
++)
++
++const djPlaylistURI = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq"
++
++// isDJContext reports whether the active context is Spotify DJ.
++func (p *AppPlayer) isDJContext() bool {
++	if p.state.player == nil {
++		return false
++	}
++	uri := p.state.player.ContextUri
++	md := p.state.player.GetContextMetadata()
++	return uri == djPlaylistURI ||
++		strings.HasPrefix(uri, "spotify:lexicon:") ||
++		md["lexicon_set_type"] == "your_dj" ||
++		md["dj.interactivity_enabled"] == "true"
++}
++
++func (p *AppPlayer) djInteractionAvailable() bool {
++	return p.state.active && p.isDJContext()
++}
++
++// ensureDJMetadata sets the metadata the Android client checks before
++// enabling the DJ request button (Lp/rnn1;->u requires lexicon_set_type).
++func (p *AppPlayer) ensureDJMetadata() {
++	if p.state.player.ContextMetadata == nil {
++		p.state.player.ContextMetadata = map[string]string{}
++	}
++	p.state.player.ContextMetadata["lexicon_set_type"] = "your_dj"
++	p.state.player.ContextMetadata["dj.interactivity_enabled"] = "true"
++}
++
++// decodePromptPayload extracts user_prompt (field 1) from a base64
++// PromptSignalPayload protobuf; falls back to the raw string.
++func decodePromptPayload(param string) string {
++	raw, err := base64.StdEncoding.DecodeString(param)
++	if err != nil || len(raw) < 2 || raw[0] != 0x0a {
++		return param
++	}
++	n, i := 0, 1
++	for shift := 0; i < len(raw); shift += 7 {
++		b := raw[i]
++		i++
++		n |= int(b&0x7f) << shift
++		if b < 0x80 {
++			break
++		}
++	}
++	if i+n > len(raw) {
++		return param
++	}
++	return string(raw[i : i+n])
++}
++
++func appendProtoVarint(buf []byte, v uint64) []byte {
++	for v >= 0x80 {
++		buf = append(buf, byte(v)|0x80)
++		v >>= 7
++	}
++	return append(buf, byte(v))
++}
++
++func appendProtoString(buf []byte, fieldNum int, val string) []byte {
++	if val == "" {
++		return buf
++	}
++	buf = appendProtoVarint(buf, uint64(fieldNum<<3|2))
++	buf = appendProtoVarint(buf, uint64(len(val)))
++	return append(buf, val...)
++}
++
++func decodeVarint(b []byte) (uint64, int) {
++	var val uint64
++	for i, c := range b {
++		val |= uint64(c&0x7f) << (i * 7)
++		if c < 0x80 {
++			return val, i + 1
++		}
++	}
++	return 0, 0
++}
++
++func parseDJAckResponse(raw []byte) (sessionID, ackText string) {
++	i := 0
++	for i < len(raw) {
++		tag, n := decodeVarint(raw[i:])
++		if n == 0 {
++			break
++		}
++		i += n
++		fieldNum := tag >> 3
++		wireType := tag & 7
++		switch wireType {
++		case 0:
++			_, n := decodeVarint(raw[i:])
++			if n == 0 {
++				return
++			}
++			i += n
++		case 2:
++			length, n := decodeVarint(raw[i:])
++			if n == 0 || i+n+int(length) > len(raw) {
++				return
++			}
++			i += n
++			val := string(raw[i : i+int(length)])
++			if fieldNum == 4 {
++				ackText = val
++			} else if fieldNum == 7 {
++				sessionID = val
++			}
++			i += int(length)
++		default:
++			return
++		}
++	}
++	return
++}
++
++func (p *AppPlayer) executeDJPrompt(prompt string) {
++	p.djPromptPending = true
++	p.ensureDJMetadata()
++	if p.state.player.ContextMetadata["interactivity_state"] == "" {
++		p.state.player.ContextMetadata["interactivity_state"] = "client-think"
++	}
++	delete(p.state.player.ContextMetadata, "interactivity_response")
++	p.flushState()
++
++	go func() {
++		ctx, cancel := context.WithTimeout(p.ctx, 20*time.Second)
++		defer cancel()
++
++		deviceId := p.app.deviceId
++		currentTrackUri := ""
++		if p.state.player != nil && p.state.player.Track != nil {
++			currentTrackUri = p.state.player.Track.Uri
++		}
++
++		p.app.log.Infof("dispatching DJ prompt to Spotify backend: %q (device=%s track=%s)", prompt, deviceId, currentTrackUri)
++
++		// 1. GetAckCommentaryAndPrepareRecs
++		var req1 []byte
++		req1 = appendProtoString(req1, 1, prompt)
++		req1 = appendProtoString(req1, 3, deviceId)
++		if currentTrackUri != "" {
++			req1 = appendProtoString(req1, 5, currentTrackUri)
++		}
++
++		header := http.Header{
++			"Accept":       []string{"application/x-protobuf"},
++			"Content-Type": []string{"application/x-protobuf"},
++		}
++
++		path1 := "/dj-interaction-manager/spotify.dj.interactionmanager.v0.DJInteractionManagerService/GetAckCommentaryAndPrepareRecs"
++		resp1, err := p.sess.Spclient().Request(ctx, "POST", path1, nil, header, req1)
++		var sessionID, ackText string
++		if err == nil && resp1 != nil {
++			body1, _ := io.ReadAll(resp1.Body)
++			_ = resp1.Body.Close()
++			sessionID, ackText = parseDJAckResponse(body1)
++			p.app.log.Infof("DJ ack commentary received: sessionID=%q ackText=%q", sessionID, ackText)
++		} else {
++			p.app.log.WithError(err).Warn("DJ GetAckCommentary request failed; proceeding to GenerateAndPlayRecs")
++		}
++
++		// 2. GenerateAndPlayRecs
++		var req2 []byte
++		req2 = appendProtoString(req2, 1, prompt)
++		if sessionID != "" {
++			req2 = appendProtoString(req2, 2, sessionID)
++		}
++		req2 = appendProtoString(req2, 3, deviceId)
++		if currentTrackUri != "" {
++			req2 = appendProtoString(req2, 5, currentTrackUri)
++		}
++		if ackText != "" {
++			req2 = appendProtoString(req2, 6, ackText)
++		}
++
++		path2 := "/dj-interaction-manager/spotify.dj.interactionmanager.v0.DJInteractionManagerService/GenerateAndPlayRecs"
++		resp2, err := p.sess.Spclient().Request(ctx, "POST", path2, nil, header, req2)
++		success := false
++		if err == nil && resp2 != nil {
++			_ = resp2.Body.Close()
++			p.app.log.Infof("DJ GenerateAndPlayRecs completed: status=%d", resp2.StatusCode)
++			if resp2.StatusCode == http.StatusOK {
++				success = true
++			}
++		} else {
++			p.app.log.WithError(err).Warn("DJ GenerateAndPlayRecs request failed")
++		}
++
++		select {
++		case p.djPromptDone <- success:
++		case <-p.ctx.Done():
++		}
++	}()
++}
++
++func (p *AppPlayer) handleDJSignal(req dealer.RequestPayload) error {
++	if !p.djInteractionAvailable() {
++		return errors.New("DJ interaction unavailable for the active context")
++	}
++	p.ensureDJMetadata()
++	switch req.Command.SignalID {
++	case "interact":
++		state := req.Command.Parameters
++		if state == "" {
++			state = "listen"
++		}
++		if state != "client-think" && state != "think" {
++			p.djPromptPending = false
++		}
++		p.state.player.ContextMetadata["interactivity_state"] = state
++		delete(p.state.player.ContextMetadata, "interactivity_response")
++		p.flushState()
++		p.app.log.Infof("DJ interaction state: %s", state)
++		return nil
++	case "jump":
++		return p.jumpDJSegment()
++	case "prompt":
++		prompt := decodePromptPayload(req.Command.Parameters)
++		p.app.log.Infof("DJ prompt signal received: %q (raw=%q)", prompt, req.Command.Parameters)
++		p.executeDJPrompt(prompt)
++		return nil
++	default:
++		p.app.log.Infof("unknown DJ signal received: %s params=%q", req.Command.SignalID, req.Command.Parameters)
++		return nil
++	}
++}
+diff --git a/daemon/player.go b/daemon/player.go
+index 12e2af9..87b2ee0 100644
+--- a/daemon/player.go
++++ b/daemon/player.go
+@@ -54,6 +54,8 @@ type AppPlayer struct {
+ 	player            *player.Player
+ 	initialVolumeOnce sync.Once
+ 	volumeUpdate      chan float32
++	djPromptDone      chan bool
++	djPromptPending   bool
+ 
+ 	loader *loaderLane
+ 
+@@ -471,18 +473,22 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 		//
+ 		// A context can arrive without a track in it, which would otherwise be
+ 		// dereferenced here; the loader then plays it from the top.
+-		p.state.player.Track = nil
+ 		if current := transferState.Playback.CurrentTrack; singleTrackContext(current) != nil {
+ 			contextSpotType := librespot.InferSpotifyIdTypeFromContext(transferState.CurrentSession.Context)
+ 			p.state.player.Track = librespot.ContextTrackToProvidedTrack(contextSpotType, current)
+ 		}
++		if p.isDJContext() || p.djPromptPending {
++			p.ensureDJMetadata()
++		}
+ 		p.state.player.PrevTracks = nil
+ 		p.state.player.NextTracks = nil
+ 		p.state.player.Index = nil
+ 		p.state.player.IsPlaying = true
+ 		p.state.player.IsBuffering = true
+ 		p.state.player.PlaybackSpeed = 0 // not progressing while buffering
+-		p.flushState()
++		if p.state.player.Track != nil {
++			p.flushState()
++		}
+ 
+ 		p.app.server.Emit(&ApiEvent{
+ 			Type: ApiEventTypeActive,
+@@ -535,6 +541,10 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 	case "pause":
+ 		return p.pause()
+ 	case "resume":
++		if p.state.player.ContextMetadata["interactivity_state"] != "" {
++			delete(p.state.player.ContextMetadata, "interactivity_state")
++			p.updateState()
++		}
+ 		return p.play()
+ 	case "seek_to":
+ 		var position int64
+@@ -563,6 +573,8 @@ func (p *AppPlayer) handlePlayerCommand(req dealer.RequestPayload) error {
+ 		return p.skipPrev(req.Command.Options.AllowSeeking)
+ 	case "skip_next":
+ 		return p.skipNext(req.Command.Track)
++	case "signal":
++		return p.handleDJSignal(req)
+ 	case "update_context":
+ 		if req.Command.Context.Uri != p.state.player.ContextUri {
+ 			p.app.log.Warnf("ignoring context update for wrong uri: %s", req.Command.Context.Uri)
+@@ -728,7 +740,13 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 		_ = p.pause()
+ 		return nil, nil
+ 	case ApiRequestTypeStop:
+-		p.stopPlayback()
++		keepSession, _ := req.Data.(bool)
++		if keepSession {
++			p.cancelPlaybackLoads()
++			p.abandonTransfer()
++		} else {
++			p.stopPlayback()
++		}
+ 		return nil, nil
+ 	case ApiRequestTypePlayPause:
+ 		if p.state.player.IsPaused {
+@@ -979,6 +997,13 @@ func (p *AppPlayer) handleApiRequest(req ApiRequest) (any, error) {
+ 			return nil, fmt.Errorf("failed reopening output: %w", err)
+ 		}
+ 		return nil, nil
++	case ApiRequestTypeDJPrompt:
++		prompt := req.Data.(string)
++		if !p.djInteractionAvailable() {
++			return nil, errors.New("DJ context is not currently active")
++		}
++		p.executeDJPrompt(prompt)
++		return map[string]string{"status": "ok", "prompt": prompt}, nil
+ 	default:
+ 		return nil, fmt.Errorf("unknown request type: %s", req.Type)
+ 	}
+@@ -1227,6 +1252,18 @@ func (p *AppPlayer) Run(apiRecv <-chan ApiRequest, mprisRecv <-chan mpris.MediaP
+ 			p.applyLoaderResult(res)
+ 		case res := <-p.statePush.results:
+ 			p.applyStatePushResult(res)
++		case success := <-p.djPromptDone:
++			if p.state != nil && p.state.player != nil {
++				if success {
++					p.djPromptPending = true
++					p.ensureDJMetadata()
++				} else {
++					p.djPromptPending = false
++					delete(p.state.player.ContextMetadata, "interactivity_state")
++					delete(p.state.player.ContextMetadata, "interactivity_response")
++					p.flushState()
++				}
++			}
+ 		case <-p.stateTimer.C:
+ 			p.statePutScheduled = false
+ 			if !p.stateDirty {
+diff --git a/daemon/player_state.go b/daemon/player_state.go
+index 11787c6..c49a4ad 100644
+--- a/daemon/player_state.go
++++ b/daemon/player_state.go
+@@ -379,6 +379,13 @@ func (p *AppPlayer) buildStateRequest(reason connectpb.PutStateReason) *connectp
+ 		putStateReq.HasBeenPlayingForMs = uint64(t.Milliseconds())
+ 	}
+ 
++	if p.djInteractionAvailable() {
++		p.ensureDJMetadata()
++		p.state.player.Signals = []string{"interact", "jump", "prompt"}
++	} else {
++		p.state.player.Signals = nil
++	}
++
+ 	putStateReq.IsActive = p.state.active
+ 	putStateReq.Device = &connectpb.Device{
+ 		DeviceInfo:  p.state.device,
+diff --git a/dealer/recv.go b/dealer/recv.go
+index 568182e..ecacaa3 100644
+--- a/dealer/recv.go
++++ b/dealer/recv.go
+@@ -43,13 +43,15 @@ type RequestPayload struct {
+ 	MessageId      uint32 `json:"message_id"`
+ 	SentByDeviceId string `json:"sent_by_device_id"`
+ 	Command        struct {
+-		Endpoint  string      `json:"endpoint"`
+-		SessionId string      `json:"session_id"`
+-		Data      []byte      `json:"data"`
+-		Value     interface{} `json:"value"`
+-		Position  int64       `json:"position"`
+-		Relative  string      `json:"relative"`
+-		TimerType *struct {
++		Endpoint   string      `json:"endpoint"`
++		SignalID   string      `json:"signal_id"`
++		Parameters string      `json:"parameters"`
++		SessionId  string      `json:"session_id"`
++		Data       []byte      `json:"data"`
++		Value      interface{} `json:"value"`
++		Position   int64       `json:"position"`
++		Relative   string      `json:"relative"`
++		TimerType  *struct {
+ 			Type      string `json:"type"`
+ 			DurationS int64  `json:"duration_s"`
+ 		} `json:"timer_type"`
+diff --git a/mp3/decoder.go b/mp3/decoder.go
+index 3e0f2ca..48fbfb4 100644
+--- a/mp3/decoder.go
++++ b/mp3/decoder.go
+@@ -33,6 +33,16 @@ import (
+ //     if (p != NULL) *p = h;
+ //     return p;
+ // }
++// static int citation_mpg123_format_all_rates(mpg123_handle *mh, int channels, int encodings) {
++//     const long *rates;
++//     size_t count;
++//     mpg123_rates(&rates, &count);
++//     for (size_t i = 0; i < count; i++) {
++//         int result = mpg123_format(mh, rates[i], channels, encodings);
++//         if (result != MPG123_OK) return result;
++//     }
++//     return MPG123_OK;
++// }
+ import "C"
+ 
+ // mpg123_init is only required once per process. It is a no-op on recent
+@@ -87,7 +97,7 @@ func New(log librespot.Logger, r librespot.SizedReadAtSeeker, gain float32) (_ *
+ 	// be narrowed before opening the stream: setting it afterwards has no effect
+ 	// until the next natural format change, which for a single clip never comes.
+ 	C.mpg123_format_none(d.mh)
+-	if res := C.mpg123_format2(d.mh, 0, C.MPG123_STEREO, C.MPG123_ENC_FLOAT_32); res != C.MPG123_OK {
++	if res := C.citation_mpg123_format_all_rates(d.mh, C.MPG123_STEREO, C.MPG123_ENC_FLOAT_32); res != C.MPG123_OK {
+ 		return nil, fmt.Errorf("could not set mpg123 format: %s", d.strerror())
+ 	}
+ 
+diff --git a/tracks/tracks.go b/tracks/tracks.go
+index 9d6180b..122f4fb 100644
+--- a/tracks/tracks.go
++++ b/tracks/tracks.go
+@@ -353,6 +353,38 @@ func (tl *List) PeekNext(ctx context.Context) *connectpb.ContextTrack {
+ 	return nil
+ }
+ 
++// JumpToNextDJSegment moves to the first track of the next DJ segment.
++// Only a successful lookup changes the current track or consumes a queue entry.
++func (tl *List) JumpToNextDJSegment(ctx context.Context) error {
++	if tl.tracks.pos < 0 {
++		return fmt.Errorf("no active DJ track list")
++	}
++
++	currentSegment := tl.tracks.get().item.GetMetadata()["segment"]
++	iter := tl.tracks.iterHere()
++	for iter.next(ctx) {
++		metadata := iter.get().item.GetMetadata()
++		if metadata["dj.jump_target"] != "true" ||
++			(currentSegment != "" && metadata["segment"] == currentSegment) {
++			continue
++		}
++
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++		tl.tracks.move(iter)
++		if tl.playingQueue {
++			tl.queue = tl.queue[1:]
++			tl.playingQueue = false
++		}
++		return nil
++	}
++	if err := iter.error(); err != nil {
++		return fmt.Errorf("fetching next DJ segment: %w", err)
++	}
++	return fmt.Errorf("no next DJ segment")
++}
++
+ func (tl *List) GoNext(ctx context.Context) bool {
+ 	if tl.playingQueue {
+ 		tl.queue = tl.queue[1:]
+diff --git a/tracks/tracks_internal_test.go b/tracks/tracks_internal_test.go
+index d9bea3f..aadd7d0 100644
+--- a/tracks/tracks_internal_test.go
++++ b/tracks/tracks_internal_test.go
+@@ -285,6 +285,43 @@ func (suite *TrackListInternalSuite) TestAllTracksIsResidentAndBounded() {
+ 	suite.Equal(loaded, suite.list.tracks.len(), "nothing was fetched")
+ }
+ 
++func (suite *TrackListInternalSuite) TestJumpToNextDJSegmentAcrossPages() {
++	pageOne := []*connectpb.ContextTrack{
++		{Uri: trackUri(0), Metadata: map[string]string{"segment": "one", "dj.jump_target": "true"}},
++		{Uri: trackUri(1), Metadata: map[string]string{"segment": "one"}},
++	}
++	pageTwo := []*connectpb.ContextTrack{
++		{Uri: trackUri(2), Metadata: map[string]string{"segment": "one", "dj.jump_target": "true"}},
++		{Uri: trackUri(3), Metadata: map[string]string{"segment": "two", "dj.jump_target": "true"}},
++		{Uri: trackUri(4), Metadata: map[string]string{"segment": "two"}},
++	}
++	suite.resolver.EXPECT().Page(mock.Anything, 0).Return(pageOne, nil)
++	suite.resolver.EXPECT().Page(mock.Anything, 1).Return(pageTwo, nil)
++	ctx := context.Background()
++	suite.Require().True(suite.list.GoStart(ctx))
++
++	suite.Require().NoError(suite.list.JumpToNextDJSegment(ctx))
++	suite.Equal(trackUri(3), suite.list.CurrentTrack().Uri)
++	suite.Require().True(suite.list.GoNext(ctx))
++	suite.Equal(trackUri(4), suite.list.CurrentTrack().Uri)
++}
++
++func (suite *TrackListInternalSuite) TestJumpWithoutTargetKeepsCurrentTrack() {
++	page := []*connectpb.ContextTrack{
++		{Uri: trackUri(0), Metadata: map[string]string{"segment": "one", "dj.jump_target": "true"}},
++		{Uri: trackUri(1), Metadata: map[string]string{"segment": "one"}},
++	}
++	suite.resolver.EXPECT().Page(mock.Anything, 0).Return(page, nil)
++	suite.resolver.EXPECT().Page(mock.Anything, 1).Return(nil, io.EOF)
++	ctx := context.Background()
++	suite.Require().True(suite.list.GoStart(ctx))
++
++	suite.Error(suite.list.JumpToNextDJSegment(ctx))
++	suite.Equal(trackUri(0), suite.list.CurrentTrack().Uri)
++	suite.Require().True(suite.list.GoNext(ctx))
++	suite.Equal(trackUri(1), suite.list.CurrentTrack().Uri)
++}
++
+ func TestTrackListInternalSuite(t *testing.T) {
+ 	suite.Run(t, new(TrackListInternalSuite))
+ }

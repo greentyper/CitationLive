@@ -148,7 +148,13 @@ check() {
         echo 'Invalid CitationLive metadata from GitHub.' >&2
         return 1
     fi
-    test "$sha" != "$(blob_sha "$target")" || return 0
+    current_sha=$(blob_sha "$target")
+    test "$sha" != "$current_sha" || return 0
+    # A locally installed build can supersede one known GitHub blob. Keep
+    # checking for new releases and honor the hold only for that exact pair.
+    if test "$sha $current_sha" = "$(cat "$state/superseded" 2>/dev/null || true)"; then
+        return 0
+    fi
     test "$sha" != "$(cat "$state/rejected" 2>/dev/null || true)" || return 0
 
     candidate=$state/candidate
@@ -183,7 +189,7 @@ check() {
     wait_ready "$target" "$live_pid"
     restart_spotify_helpers
     clear_rollback
-    rm -f "$state/rejected"
+    rm -f "$state/rejected" "$state/superseded"
     printf 'Updated CitationLive to GitHub blob %s\n' "$sha"
 }
 

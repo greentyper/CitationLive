@@ -145,7 +145,7 @@ func cloudContextActivity(ctx context.Context, manualActivity bool, musicPlaying
 	declarations := setup["setup"].(M)["tools"].([]M)[0]["functionDeclarations"].([]M)
 	declarations = append(declarations, M{
 		"name":        "play_music",
-		"description": "Play music from Spotify (tracks, playlists, albums, artists). For an explicitly named playlist use music_type='playlist', playlist_mode='named' and the exact title. For a generic request («включи музыку», «play something») use music_type='playlist', playlist_mode='mood' and an empty track; the speaker chooses a playlist from the user's library. For mood, genre, activity or vibe requests use music_type='playlist', playlist_mode='mood' and the mood in track. For DJ use music_type='playlist', playlist_mode='named', track='DJ'. For daylist use track='daylist'. Do not invent a playlist title or URI. If a title/artist is mentioned, put the exact title in track and the artist in artist. Never ask what to play for a generic request.",
+		"description": "Play music from Spotify (tracks, playlists, albums, artists). For an explicitly named playlist use music_type='playlist', playlist_mode='named' and the exact title. For a generic request («включи музыку», «play something») use music_type='playlist' and an empty track; the speaker alternates Spotify DJ and Daylist. For mood, genre, activity or vibe requests use music_type='playlist', playlist_mode='mood' and the mood in track. For DJ use music_type='playlist', playlist_mode='named', track='DJ'. For Daylist use track='daylist'. If a title or artist is mentioned, preserve the exact words.",
 		"parameters": M{
 			"type": "OBJECT",
 			"properties": M{
@@ -407,16 +407,7 @@ func toolContext(ctx context.Context, name string, args M) M {
 				return M{"ok": true, "action": action, "backend": "spotify_api"}
 			}
 			if action == "resume" {
-				log.Println("Spotify resume failed, attempting fallback to play_music:", err)
-				request := prepareMusic(M{"music_type": "playlist", "track": ""})
-				if request["ok"] == true && directSpotify.connected() {
-					if resolved := directSpotify.resolve(request); resolved["ok"] == true {
-						return directSpotify.playContext(ctx, resolved)
-					} else {
-						return resolved
-					}
-				}
-				return M{"ok": false, "error": "Не удалось возобновить музыку: на телефоне или колонке ничего не играло."}
+				return M{"ok": false, "error": clean(err)}
 			}
 		}
 		_, err = wampCall(p)
@@ -1744,7 +1735,7 @@ func (c *controller) startAfterNativeWake(nativeStopped <-chan struct{}) {
 							musicSelection = selection
 							musicLaunch = make(chan M, 1)
 							go func(launched chan<- M) {
-								playCtx, cancelPlay := context.WithTimeout(ctx, 12*time.Second)
+								playCtx, cancelPlay := context.WithTimeout(ctx, 27*time.Second)
 								defer cancelPlay()
 								launched <- directSpotify.playContext(playCtx, selection)
 							}(musicLaunch)

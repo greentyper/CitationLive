@@ -41,6 +41,7 @@ func controlPhrase(text string) string {
 }
 func quickMediaAction(text string) string {
 	phrase := controlPhrase(text)
+	phrase = strings.TrimPrefix(strings.TrimPrefix(phrase, "ну "), "давай ")
 	for _, provider := range []string{" в spotify", " на spotify", " в спотифай", " на спотифае", " on spotify"} {
 		phrase = strings.TrimSuffix(phrase, provider)
 	}

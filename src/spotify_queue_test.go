@@ -5,6 +5,7 @@ import "testing"
 func TestQuickMediaNewMusicAndTransport(t *testing.T) {
 	for phrase, want := range map[string]string{
 		"Эй, Google, включи музыку.":   "play",
+		"Ну, включи музыку.":           "play",
 		"Эй, Google, музыку.":          "play",
 		"Вруби музыку в Spotify":       "play",
 		"Play music":                   "play",
