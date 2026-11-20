@@ -43,21 +43,45 @@ func bluetoothEnabled(ctx context.Context) (bool, error) {
 }
 
 func controlBluetooth(ctx context.Context, action string) M {
-	if action != "on" && action != "off" && action != "status" {
-		return M{"ok": false, "error": "Укажите действие Bluetooth: on, off или status."}
+	if action != "on" && action != "off" && action != "status" && action != "pair" {
+		return M{"ok": false, "error": "Укажите действие Bluetooth: on, off, status или pair."}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 8*time.Second)
 	defer cancel()
 	bluetoothMu.Lock()
 	defer bluetoothMu.Unlock()
 
+	if action == "pair" {
+		if result := changeBluetoothPower(ctx, "on"); result["ok"] != true {
+			return result
+		}
+		if _, err := wampCallTimeout(3*time.Second, "com.harman.bluetooth.pairing", M{}, true); err != nil {
+			return M{"ok": false, "error": "Не удалось запустить сопряжение Bluetooth на колонке."}
+		}
+		state, err := wampCallTimeout(2*time.Second, "com.harman.stateGet", M{})
+		if err == nil && len(state) > 4 {
+			fields, _ := state[4].(map[string]any)
+			bluetooth, _ := fields["bluetooth"].(map[string]any)
+			if bluetooth["state"] == "pairing" {
+				return M{"ok": true, "enabled": true, "pairing_requested": true}
+			}
+		}
+		return M{"ok": false, "error": "Колонка не подтвердила режим сопряжения Bluetooth."}
+	}
+	return changeBluetoothPower(ctx, action)
+}
+
+func changeBluetoothPower(ctx context.Context, action string) M {
 	enabled, err := bluetoothEnabled(ctx)
 	if err != nil {
 		return M{"ok": false, "error": err.Error()}
 	}
 	wanted := action == "on"
-	if action == "status" || enabled == wanted {
+	if action == "status" {
 		return M{"ok": true, "enabled": enabled}
+	}
+	if enabled == wanted {
+		return M{"ok": true, "enabled": enabled, "changed": false}
 	}
 	command := "disable"
 	if wanted {
@@ -75,7 +99,7 @@ func controlBluetooth(ctx context.Context, action string) M {
 		case <-timer.C:
 		}
 		if enabled, err = bluetoothEnabled(ctx); err == nil && enabled == wanted {
-			return M{"ok": true, "enabled": enabled}
+			return M{"ok": true, "enabled": enabled, "changed": true}
 		}
 	}
 	return M{"ok": false, "error": "Колонка не подтвердила смену состояния Bluetooth."}
